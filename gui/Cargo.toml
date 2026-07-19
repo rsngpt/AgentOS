@@ -1,0 +1,21 @@
+[package]
+name = "agentos-gui"
+description = "Agent OS desktop app: sandbox manager, permission editor, live terminal, network monitor, and the kill switch. Tauri shell over the agentosd socket."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agentos-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+agentos-client = { path = "../crates/agentos-client" }
+agentos-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+tokio.workspace = true

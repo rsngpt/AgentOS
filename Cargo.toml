@@ -5,7 +5,9 @@ members = [
     "crates/agentos-vmm",
     "crates/agentos-daemon",
     "crates/agentos-cli",
+    "crates/agentos-client",
     "crates/agentos-guest-agent",
+    "gui",
 ]
 
 [workspace.package]

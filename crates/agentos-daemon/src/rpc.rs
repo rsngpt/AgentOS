@@ -52,6 +52,27 @@ pub async fn serve_connection(
             return Ok(()); // connection was dedicated to this run
         }
 
+        if req.method == "events.subscribe" {
+            // Dedicated connection: stream every registry event as a JSON
+            // line until the client goes away (write failure ends us).
+            let mut rx = registry.subscribe_events();
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let mut line = serde_json::to_vec(&event)?;
+                        line.push(b'\n');
+                        if write.write_all(&line).await.is_err() {
+                            return Ok(());
+                        }
+                        write.flush().await.ok();
+                    }
+                    // Fell behind the broadcast buffer: skip and continue.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+        }
+
         let result = unary(&req, &registry).await;
         respond(&mut write, req.id, result).await?;
     }

@@ -44,6 +44,7 @@ async fn main() {
                 println!("killed");
                 0
             }),
+        Command::Events => client::events().await,
     };
 
     match result {

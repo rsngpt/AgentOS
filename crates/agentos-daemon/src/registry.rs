@@ -2,12 +2,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use agentos_core::event::{Event, EventKind};
 use agentos_core::{
     Error, Result, SandboxId, SandboxSpec, SandboxState, TerminationDisposition,
 };
 use agentos_vmm::VmHandle;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 
 /// Shared, lockable VM handle. The run task holds the lock only briefly
 /// (reap after EOF); the stream pumping happens on a separate vsock stream,
@@ -23,13 +25,32 @@ pub struct Sandbox {
 #[derive(Clone)]
 pub struct Registry {
     inner: Arc<Mutex<HashMap<SandboxId, Sandbox>>>,
+    events: broadcast::Sender<Event>,
 }
 
 impl Registry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            events: broadcast::channel(1024).0,
         }
+    }
+
+    /// Publish an event to every live `events.subscribe` client (dropped
+    /// silently when nobody listens).
+    pub fn emit_event(&self, sandbox: SandboxId, kind: EventKind) {
+        let _ = self.events.send(Event {
+            sandbox,
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            kind,
+        });
+    }
+
+    pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
+        self.events.subscribe()
     }
 
     /// Register a sandbox in `Provisioning` state and return its id.
@@ -57,7 +78,8 @@ impl Registry {
     pub async fn set_state(&self, id: &SandboxId, state: SandboxState) {
         if let Some(sb) = self.inner.lock().await.get_mut(id) {
             if !sb.state.is_terminal() {
-                sb.state = state;
+                sb.state = state.clone();
+                self.emit_event(id.clone(), EventKind::StateChanged { new_state: state });
             }
         }
     }

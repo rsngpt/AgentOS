@@ -301,9 +301,11 @@ mod linux {
             for (i, b) in b"lo\0".iter().enumerate() {
                 ifr.ifr_name[i] = *b as libc::c_char;
             }
-            if libc::ioctl(fd, libc::SIOCGIFFLAGS as libc::c_int, &mut ifr) == 0 {
+            // ioctl's request parameter is c_ulong on glibc but c_int on
+            // musl; an inferred cast compiles against both.
+            if libc::ioctl(fd, libc::SIOCGIFFLAGS as _, &mut ifr) == 0 {
                 ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-                libc::ioctl(fd, libc::SIOCSIFFLAGS as libc::c_int, &ifr);
+                libc::ioctl(fd, libc::SIOCSIFFLAGS as _, &ifr);
             }
             libc::close(fd);
         }

@@ -16,10 +16,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use agentos_core::NetPolicy;
+use agentos_core::event::EventKind;
+use agentos_core::{NetPolicy, SandboxId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tracing::{debug, info, warn};
+
+use crate::registry::Registry;
 
 const MAX_HEADER: usize = 16 * 1024;
 
@@ -28,6 +31,8 @@ pub async fn serve(
     socket_path: &Path,
     policy: NetPolicy,
     bytes_total: Arc<AtomicU64>,
+    registry: Registry,
+    sandbox: SandboxId,
 ) -> std::io::Result<()> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
@@ -35,8 +40,10 @@ pub async fn serve(
         let (conn, _) = listener.accept().await?;
         let policy = policy.clone();
         let bytes = bytes_total.clone();
+        let registry = registry.clone();
+        let sandbox = sandbox.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(conn, policy, bytes).await {
+            if let Err(e) = handle_connection(conn, policy, bytes, registry, sandbox).await {
                 debug!(error = %e, "proxy connection ended");
             }
         });
@@ -47,6 +54,8 @@ async fn handle_connection(
     mut guest: UnixStream,
     policy: NetPolicy,
     bytes_total: Arc<AtomicU64>,
+    registry: Registry,
+    sandbox: SandboxId,
 ) -> std::io::Result<()> {
     // Read the request head (everything through \r\n\r\n).
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
@@ -83,8 +92,20 @@ async fn handle_connection(
         return refuse(&mut guest, "400 Bad Request").await;
     };
 
+    let emit_verdict = |allowed: bool| {
+        registry.emit_event(
+            sandbox.clone(),
+            EventKind::NetVerdict {
+                dest_host: host.clone(),
+                dest_port: port,
+                allowed,
+            },
+        );
+    };
+
     if host.is_empty() || !verdict(&policy, &host) {
         info!(%host, port, verdict = "deny", "egress");
+        emit_verdict(false);
         return refuse(&mut guest, "403 Forbidden").await;
     }
 
@@ -96,6 +117,7 @@ async fn handle_connection(
     };
     if addrs.is_empty() {
         info!(%host, port, verdict = "deny-resolved-local-or-unresolvable", "egress");
+        emit_verdict(false);
         return refuse(&mut guest, "403 Forbidden").await;
     }
 
@@ -107,6 +129,7 @@ async fn handle_connection(
         }
     };
     info!(%host, port, verdict = "allow", "egress");
+    emit_verdict(true);
 
     if is_connect {
         guest

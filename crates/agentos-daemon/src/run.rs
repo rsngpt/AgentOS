@@ -113,8 +113,10 @@ async fn drive(
         let policy = spec.net.clone();
         let bytes = egress_bytes.clone();
         let sock = path.clone();
+        let reg = registry.clone();
+        let sid = id.clone();
         let task = tokio::spawn(async move {
-            if let Err(e) = proxy::serve(&sock, policy, bytes).await {
+            if let Err(e) = proxy::serve(&sock, policy, bytes, reg, sid).await {
                 tracing::warn!(error = %e, "egress proxy stopped");
             }
         });

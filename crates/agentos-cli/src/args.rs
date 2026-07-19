@@ -30,6 +30,8 @@ pub enum Command {
         #[arg(long)]
         save: bool,
     },
+    /// Stream daemon events (state changes, network verdicts, resource samples).
+    Events,
 }
 
 #[derive(Args)]

@@ -61,8 +61,10 @@ jobs:
           cloud-hypervisor --version
           virtiofsd --version
 
-      - run: cargo build --workspace
-      - run: cargo test --workspace
+      # GUI excluded: tauri needs webkit2gtk dev packages; the desktop app is
+      # built and tested on macOS.
+      - run: cargo build --workspace --exclude agentos-gui
+      - run: cargo test --workspace --exclude agentos-gui
       - run: cargo build -p agentos-guest-agent --release --target x86_64-unknown-linux-musl
       - name: Build guest image
         run: ./scripts/build-guest-image.sh

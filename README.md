@@ -33,6 +33,10 @@ cargo build -p agentos-guest-agent --release --target aarch64-unknown-linux-musl
     -- python3 agent.py
 ./target/debug/agentos ps
 ./target/debug/agentos kill <id>               # the kill switch (--save keeps logs)
+./target/debug/agentos events                  # stream the daemon event bus
+./target/debug/agentos-gui                     # desktop app (Tauri)
+
+./scripts/e2e-test.sh                          # full policy test suite in real microVMs
 ```
 
-Status: **M2 complete** — mounts (RO enforced host-side), egress policy proxy (offline / allowlist / full, LAN+localhost always blocked), quotas with auto-kill, save|wipe dispositions. Next: M3 (Linux backend); see ARCHITECTURE.md §11.
+Status: **M1–M4 complete** on macOS (microVMs, mounts, network policy, quotas, GUI); Linux Cloud Hypervisor backend implemented and exercised by CI on KVM runners. See ARCHITECTURE.md §11.

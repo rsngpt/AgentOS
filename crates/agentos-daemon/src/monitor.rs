@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use agentos_core::event::EventKind;
 use agentos_core::{AutoKillRules, SandboxId, TerminationDisposition};
 use tracing::warn;
 
@@ -35,8 +36,9 @@ pub fn breached_rule(
     None
 }
 
-/// Sample once a second; kill through the registry (the same absolute path
-/// as the manual kill switch) when a rule fires.
+/// Sample once a second: publish a `ResourceSample` event (the GUI's live
+/// dashboard feed) and kill through the registry (the same absolute path as
+/// the manual kill switch) when a rule fires.
 pub async fn watch(
     registry: Registry,
     id: SandboxId,
@@ -44,17 +46,24 @@ pub async fn watch(
     guest_mem_mib: Arc<AtomicU32>,
     egress_bytes: Arc<AtomicU64>,
 ) {
-    if rules == AutoKillRules::default() {
-        return; // nothing to enforce
-    }
     let started = Instant::now();
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let mem = guest_mem_mib.load(Ordering::Relaxed);
-        let egress_mib = egress_bytes.load(Ordering::Relaxed) / (1024 * 1024);
+        let egress_total = egress_bytes.load(Ordering::Relaxed);
+        let egress_mib = egress_total / (1024 * 1024);
         let runtime = started.elapsed().as_secs();
+        registry.emit_event(
+            id.clone(),
+            EventKind::ResourceSample {
+                cpu_percent: 0, // host-side CPU sampling is future work
+                mem_mib: mem,
+                egress_total_bytes: egress_total,
+            },
+        );
         if let Some(rule) = breached_rule(&rules, mem, egress_mib, runtime) {
             warn!(%id, rule, mem, egress_mib, runtime, "auto-kill rule fired");
+            registry.emit_event(id.clone(), EventKind::AutoKillTriggered { rule: rule.into() });
             if let Err(e) = registry
                 .kill(&id, &format!("auto-kill: {rule}"), TerminationDisposition::Wipe)
                 .await
