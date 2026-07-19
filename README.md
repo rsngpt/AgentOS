@@ -1,5 +1,7 @@
 # Agent OS
 
+[![CI](https://github.com/rsngpt/AgentOS/actions/workflows/ci.yml/badge.svg)](https://github.com/rsngpt/AgentOS/actions/workflows/ci.yml)
+
 Run untrusted AI agents in hardware-isolated microVM sandboxes on your own machine — granular filesystem grants, policy-controlled networking, and an absolute kill switch.
 
 **Start with [ARCHITECTURE.md](ARCHITECTURE.md)** — the technical design (threat model, hypervisor backends, network model, milestones).
