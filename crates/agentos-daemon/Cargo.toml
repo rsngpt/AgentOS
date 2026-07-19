@@ -1,0 +1,19 @@
+[package]
+name = "agentos-daemon"
+description = "agentosd: the Agent OS control-plane daemon. Owns sandboxes, enforces policy, runs the egress proxy and resource monitor."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agentosd"
+path = "src/main.rs"
+
+[dependencies]
+agentos-core.workspace = true
+agentos-vmm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

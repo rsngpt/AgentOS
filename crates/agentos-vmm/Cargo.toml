@@ -1,0 +1,13 @@
+[package]
+name = "agentos-vmm"
+description = "Hypervisor abstraction for Agent OS: the VmmBackend/VmHandle traits and per-OS microVM backends."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agentos-core.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

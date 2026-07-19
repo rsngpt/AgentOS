@@ -1,0 +1,13 @@
+[package]
+name = "agentos-guest-agent"
+description = "PID 1 inside an Agent OS microVM: mounts shares, execs the agent command, streams stdio and metrics over vsock. Built as a static musl binary for the guest image."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agentos-guest-agent"
+path = "src/main.rs"
+
+[dependencies]
+agentos-core.workspace = true
