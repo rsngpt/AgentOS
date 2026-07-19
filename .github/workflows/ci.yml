@@ -24,7 +24,8 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo check --workspace --target aarch64-unknown-linux-musl
+      # GUI excluded: tauri's platform crates don't cross-compile to Linux musl.
+      - run: cargo check --workspace --exclude agentos-gui --target aarch64-unknown-linux-musl
       - run: cargo build -p agentos-guest-agent --release --target aarch64-unknown-linux-musl
       - name: Build vmhelper (Swift)
         run: ./scripts/build-vmhelper.sh

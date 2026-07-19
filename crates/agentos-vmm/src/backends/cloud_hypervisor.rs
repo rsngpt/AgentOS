@@ -82,10 +82,18 @@ impl VmmBackend for CloudHypervisorBackend {
             let sock = dir.join(format!("fs{i}.sock"));
             let log = std::fs::File::create(dir.join(format!("fs{i}.log")))?;
             let mut cmd = Command::new(&self.virtiofsd_bin);
+            // --sandbox none: the default (namespace) needs unprivileged user
+            // namespaces, which Ubuntu 24.04+ blocks via AppArmor. virtiofsd
+            // still runs as the invoking user and can expose nothing beyond
+            // the directory the user explicitly granted (same trust model as
+            // the macOS in-process share). TODO: auto-upgrade to namespace
+            // sandboxing where the host allows it.
             cmd.arg("--socket-path")
                 .arg(&sock)
                 .arg("--shared-dir")
                 .arg(&m.host_path)
+                .arg("--sandbox")
+                .arg("none")
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log.try_clone()?))
                 .stderr(Stdio::from(log))
