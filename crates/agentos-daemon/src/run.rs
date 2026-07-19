@@ -46,6 +46,7 @@ pub async fn run_sandbox(
     match drive(&registry, &id, spec, client).await {
         Ok(()) => Ok(()),
         Err(e) => {
+            tracing::warn!(%id, error = %e, "sandbox run failed");
             registry
                 .set_state(
                     &id,

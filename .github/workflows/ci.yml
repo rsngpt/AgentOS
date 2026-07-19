@@ -71,6 +71,13 @@ jobs:
         run: ./scripts/build-guest-image.sh
       - name: End-to-end microVM tests
         run: ./scripts/e2e-test.sh
-      - name: Daemon log on failure
+      - name: Daemon and sandbox logs on failure
         if: failure()
-        run: cat ~/.agentos/agentosd.log 2>/dev/null || true
+        run: |
+          cat ~/.agentos/agentosd.log 2>/dev/null || true
+          for d in ~/.agentos/sandboxes/*/; do
+            echo "=== $d ==="
+            for f in helper.log fs0.log console.log; do
+              [ -f "$d$f" ] && { echo "--- $f ---"; tail -30 "$d$f"; }
+            done
+          done || true

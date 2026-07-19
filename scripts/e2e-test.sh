@@ -41,10 +41,13 @@ M=$(mktemp -d)
 mkdir -p "$M/ro" "$M/rw"
 echo hello > "$M/ro/f.txt"
 out=$("$AGENTOS" run --mount "$M/ro" --mount "$M/rw:rw" -- sh -c \
-    'cat /mnt/ro/f.txt; echo guest > /mnt/rw/out.txt 2>/dev/null && echo rw-ok; echo x > /mnt/ro/f2.txt 2>/dev/null && echo RO-LEAK || echo ro-blocked' 2>/dev/null)
+    'cat /mnt/ro/f.txt; echo guest > /mnt/rw/out.txt 2>/dev/null && echo rw-ok; echo x > /mnt/ro/f2.txt 2>/dev/null && echo RO-LEAK || echo ro-blocked' 2>/tmp/agentos-e2e-mount-err.txt)
 check "mount behavior" "hello
 rw-ok
 ro-blocked" "$out"
+[ "$out" = "hello
+rw-ok
+ro-blocked" ] || { echo "  mount run stderr was:" >&2; sed 's/^/  /' /tmp/agentos-e2e-mount-err.txt >&2; }
 check "rw mount round-trips to host" "guest" "$(cat "$M/rw/out.txt" 2>/dev/null)"
 rm -rf "$M"
 
