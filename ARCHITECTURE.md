@@ -83,7 +83,7 @@ trait VmHandle {
 | OS | Backend | Rationale |
 |---|---|---|
 | macOS | **Virtualization.framework**, hosted in a small Swift helper (`vmhelper/`) spawned per sandbox | Apple-blessed API with first-class virtio-fs and vsock; no kext. The helper *is* the VM process — it boots the guest and relays the vsock control stream over its stdio — which makes kill-by-SIGKILL trivial and keeps the Objective-C surface out of the Rust core. Signed with the `com.apple.security.virtualization` entitlement. |
-| Linux | **Cloud Hypervisor** (child process, driven over its REST API socket) | Firecracker was rejected because it has no virtio-fs — our mount model requires it. Cloud Hypervisor is KVM-based, boots in hundreds of ms, and supports virtio-fs via an external `virtiofsd`. |
+| Linux | **Cloud Hypervisor** (child process; CLI-configured, hybrid-vsock Unix sockets) | Firecracker was rejected because it has no virtio-fs — our mount model requires it. Cloud Hypervisor is KVM-based, boots in hundreds of ms, and supports virtio-fs via one unprivileged `virtiofsd` per share (`--readonly` enforced host-side; requires `--memory shared=on`). Host⇄guest control uses the Firecracker-style `CONNECT <port>` handshake on the vsock UDS; guest-initiated connections to port P surface at `<socket>_P`. |
 | Windows | **Stub** (`Unsupported` error) | Future path: WHP-based backend, or reusing the Linux backend inside a WSL2 utility VM. Deferred until macOS + Linux are proven. |
 
 The trait is deliberately narrow: the daemon never learns backend specifics, and adding Windows later touches only `agentos-vmm`.
@@ -144,7 +144,7 @@ Provisioning → Booting → Running → Exited
 
 - **M1 — "Hello, sandbox" (macOS)**: ✅ done. `agentos run -- echo hi` boots a microVM via Virtualization.framework, streams stdio, exits, wipes; `agentos ps`/`kill` work. Measured: ~0.8 s from spawn to guest exit (boot ≈ 60 ms).
 - **M2 — Policy**: ✅ done. virtio-fs mounts (RO/RW, host-enforced — a root guest remounting rw still cannot write), egress proxy with all three network modes (localhost/LAN blocked even in `full`, DNS resolved host-side with local-address filtering), kill switch save|wipe dispositions, and auto-kill on memory/egress/runtime with incremental egress counting. This is the PRD's MVP feature bar.
-- **M3 — Linux backend**: Cloud Hypervisor implementation of `VmmBackend`; CI proving both backends against one integration-test suite.
+- **M3 — Linux backend**: 🔨 implemented, awaiting Linux runtime verification. `CloudHypervisorBackend` spawns `cloud-hypervisor` (hybrid vsock, no NIC, one unprivileged `virtiofsd` per mount with host-side `--readonly`); guest-initiated egress lands on the `<vsock_socket>_1025` Unix socket where the daemon binds its proxy (`VmmBackend::proxy_socket_path`). Compile-verified for Linux targets from macOS; the shared e2e suite (`scripts/e2e-test.sh`, backend-agnostic, 11 assertions) passes on macOS/vz, and `.github/workflows/ci.yml` runs it on KVM-enabled Ubuntu runners — first real Linux run happens when the repo gets a GitHub remote.
 - **M4 — GUI**: Tauri desktop app over the same JSON-RPC socket — sandbox list, permission editor, live terminal, network monitor, big red Terminate button.
 - **Later**: Windows backend, enterprise fleet policy, snapshotting, prebuilt agent templates (per PRD §7).
 

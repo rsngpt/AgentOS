@@ -34,7 +34,13 @@ End-to-end smoke test (boots a real microVM, ~1s):
 ```sh
 ./target/debug/agentos run -- echo hi
 ./target/debug/agentos run --mount /tmp/x:rw --net allowlist:example.com -- sh -c '...'
+./scripts/e2e-test.sh          # full backend-agnostic policy test suite
 ```
+
+Linux backend (Cloud Hypervisor) can only be compile-checked from macOS:
+`cargo check --workspace --target aarch64-unknown-linux-musl`. Runtime
+verification happens in CI (`.github/workflows/ci.yml`, KVM-enabled Ubuntu
+runner) or on a real Linux host with `cloud-hypervisor` + `virtiofsd` on PATH.
 
 Debugging a failed boot/run: `agentos kill --save <id>` or any error keeps `~/.agentos/sandboxes/<id>/` with `console.log` (guest kernel + guest-agent stderr), `helper.log` (vmhelper), `vmconfig.json`. Daemon log: `~/.agentos/agentosd.log`.
 
@@ -48,7 +54,7 @@ agentos (CLI) --UDS JSON lines--> agentosd --spawns--> agentos-vmhelper (Swift)
 ```
 
 - **Control path**: daemon ⇄ guest-agent speak length-prefixed (u32 LE) JSON frames — types in `agentos-core/src/protocol.rs`, sync codec in the guest agent, async codec in `agentos-daemon/src/frames.rs`. The vmhelper is a dumb byte relay: guest vsock port 1024 ⇄ helper stdio ⇄ daemon. `sandbox.run` is a *streaming* RPC — the UDS connection is dedicated to the run and carries `{event: ...}` lines; other methods are unary JSON-RPC (`agentos-daemon/src/rpc.rs`).
-- **Egress path**: guest loopback TCP :3128 (forwarder in guest agent) → guest-initiated vsock to port 1025 → vmhelper's `VZVirtioSocketListener` bridges to `~/.agentos/sandboxes/<id>/proxy.sock` → `agentos-daemon/src/proxy.rs` parses HTTP CONNECT/absolute-URI and applies `NetPolicy`. All policy, DNS, and byte counting are host-side by design; the guest side is deliberately a dumb pipe. Byte counting must stay *incremental* (per chunk) — counting at connection close breaks egress quotas.
+- **Egress path**: guest loopback TCP :3128 (forwarder in guest agent) → guest-initiated vsock to port 1025 → a per-sandbox Unix socket → `agentos-daemon/src/proxy.rs` parses HTTP CONNECT/absolute-URI and applies `NetPolicy`. The UDS location is backend-specific (`VmmBackend::proxy_socket_path`): the vz helper bridges to an arbitrary path via `VZVirtioSocketListener`, while Cloud Hypervisor's hybrid vsock *requires* `<vsock_socket>_1025`. Host-initiated CH connections need the `CONNECT <port>\n` / `OK` handshake (see `backends/cloud_hypervisor.rs`). All policy, DNS, and byte counting are host-side by design; the guest side is deliberately a dumb pipe. Byte counting must stay *incremental* (per chunk) — counting at connection close breaks egress quotas.
 - **Mount tags**: the daemon and the vz backend independently derive virtio-fs tags from `SandboxSpec.mounts` order via `agentos_vmm::share_tag(i)` — keep them in sync through that function only.
 - **Kill semantics**: `registry.kill()` SIGKILLs the helper; the run task in `agentos-daemon/src/run.rs` notices vsock EOF, reaps, and applies the save|wipe disposition. The registry refuses state transitions out of terminal states (kill-vs-exit races resolve to whoever landed first).
 - **Guest image**: `scripts/build-guest-image.sh` unwraps Alpine's EFI-zboot kernel to the raw ARM64 Image (Virtualization.framework can't boot zboot PEs) and stages vsock+fuse+virtiofs `.ko`s into the initramfs (Alpine's virt kernel builds them `=m`); the guest agent loads them from `/lib/modules/agentos/order`. If you need another kernel module, add it to both the script's `stage_module` list and check its deps.

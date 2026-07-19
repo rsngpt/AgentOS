@@ -67,6 +67,14 @@ pub trait VmmBackend: Send + Sync {
     /// Short backend identifier for logs and `agentos ps` (e.g. `"vz"`, `"cloud-hypervisor"`).
     fn name(&self) -> &'static str;
 
+    /// Where the daemon must bind this sandbox's egress-proxy Unix socket so
+    /// that guest-initiated vsock connections to [`agentos_core::HOST_PROXY_PORT`]
+    /// reach it. Backends with fixed naming conventions (Cloud Hypervisor's
+    /// hybrid vsock `<socket>_<port>`) override this.
+    fn proxy_socket_path(&self, sandbox_dir: &std::path::Path) -> PathBuf {
+        sandbox_dir.join("proxy.sock")
+    }
+
     /// Boot a microVM for `spec`. Returns once the VMM process is spawned;
     /// the caller completes the guest-agent handshake via [`VmHandle::connect_vsock`].
     async fn create(&self, spec: &SandboxSpec, paths: &SandboxPaths) -> Result<Box<dyn VmHandle>>;

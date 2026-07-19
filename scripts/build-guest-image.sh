@@ -1,21 +1,28 @@
 #!/bin/sh
-# Build the Agent OS guest image for aarch64 macOS hosts:
-#   ~/.agentos/images/kernel            - Alpine linux-virt kernel (uncompressed Image)
+# Build the Agent OS guest image (works on macOS and Linux hosts):
+#   ~/.agentos/images/kernel            - Alpine linux-virt kernel
 #   ~/.agentos/images/initramfs.cpio.gz - Alpine minirootfs + agentos-guest-agent as /init
 #
-# The virt kernel ships vsock as modules, so the needed .ko files are staged
-# into the initramfs at /lib/modules/agentos and loaded by the guest agent.
+# The virt kernel ships vsock/virtiofs as modules, so the needed .ko files are
+# staged into the initramfs at /lib/modules/agentos and loaded by the guest agent.
 #
-# Requires: curl, bsdcpio (macOS built-in), unsquashfs (brew install squashfs),
-# and a prior `cargo build -p agentos-guest-agent --release --target aarch64-unknown-linux-musl`.
+# Requires: curl, cpio (bsdcpio or GNU), unsquashfs (brew install squashfs /
+# apt install squashfs-tools), python3, and a prior
+# `cargo build -p agentos-guest-agent --release --target <arch>-unknown-linux-musl`.
+#
+# Guest arch defaults to the host's; override with GUEST_ARCH=aarch64|x86_64.
 set -eu
 cd "$(dirname "$0")/.."
 
 MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine/latest-stable}"
-ARCH=aarch64
+case "${GUEST_ARCH:-$(uname -m)}" in
+    arm64|aarch64) ARCH=aarch64 ;;
+    x86_64|amd64)  ARCH=x86_64 ;;
+    *) echo "unsupported guest arch: ${GUEST_ARCH:-$(uname -m)}" >&2; exit 1 ;;
+esac
 IMAGES="$HOME/.agentos/images"
 CACHE="$HOME/.agentos/cache"
-GUEST_AGENT=target/aarch64-unknown-linux-musl/release/agentos-guest-agent
+GUEST_AGENT=target/$ARCH-unknown-linux-musl/release/agentos-guest-agent
 
 [ -f "$GUEST_AGENT" ] || { echo "guest agent not built: $GUEST_AGENT" >&2; exit 1; }
 mkdir -p "$IMAGES" "$CACHE"
@@ -29,36 +36,41 @@ fetch() { # fetch <url> <dest>
 VER=$(curl -fsSL "$MIRROR/releases/$ARCH/latest-releases.yaml" | awk '/^  version:/{print $2; exit}')
 echo "alpine version: $VER"
 
-fetch "$MIRROR/releases/$ARCH/alpine-minirootfs-$VER-$ARCH.tar.gz" "$CACHE/minirootfs-$VER.tar.gz"
-fetch "$MIRROR/releases/$ARCH/netboot/vmlinuz-virt" "$CACHE/vmlinuz-virt-$VER"
-fetch "$MIRROR/releases/$ARCH/netboot/modloop-virt" "$CACHE/modloop-virt-$VER"
+fetch "$MIRROR/releases/$ARCH/alpine-minirootfs-$VER-$ARCH.tar.gz" "$CACHE/minirootfs-$VER-$ARCH.tar.gz"
+fetch "$MIRROR/releases/$ARCH/netboot/vmlinuz-virt" "$CACHE/vmlinuz-virt-$VER-$ARCH"
+fetch "$MIRROR/releases/$ARCH/netboot/modloop-virt" "$CACHE/modloop-virt-$VER-$ARCH"
 
-# Kernel: Virtualization.framework needs an uncompressed ARM64 Image.
-# Alpine ships vmlinuz-virt either gzipped or as an EFI zboot PE ("MZ..zimg")
-# whose gzip payload we must unwrap (header: payload offset @8, size @12, LE).
-KSRC="$CACHE/vmlinuz-virt-$VER"
-if [ "$(dd if="$KSRC" bs=1 skip=4 count=4 2>/dev/null)" = "zimg" ]; then
-    python3 - "$KSRC" "$IMAGES/kernel.tmp" <<'EOF'
+KSRC="$CACHE/vmlinuz-virt-$VER-$ARCH"
+if [ "$ARCH" = aarch64 ]; then
+    # aarch64 VMMs need an uncompressed ARM64 Image. Alpine ships vmlinuz-virt
+    # either gzipped or as an EFI zboot PE ("MZ..zimg") whose gzip payload we
+    # must unwrap (header: payload offset @8, size @12, LE).
+    if [ "$(dd if="$KSRC" bs=1 skip=4 count=4 2>/dev/null)" = "zimg" ]; then
+        python3 - "$KSRC" "$IMAGES/kernel.tmp" <<'EOF'
 import gzip, struct, sys
 data = open(sys.argv[1], "rb").read()
 off, size = struct.unpack_from("<II", data, 8)
 open(sys.argv[2], "wb").write(gzip.decompress(data[off:off + size]))
 EOF
-elif file "$KSRC" | grep -q gzip; then
-    gunzip -c "$KSRC" > "$IMAGES/kernel.tmp"
+    elif file "$KSRC" | grep -q gzip; then
+        gunzip -c "$KSRC" > "$IMAGES/kernel.tmp"
+    else
+        cp "$KSRC" "$IMAGES/kernel.tmp"
+    fi
+    # Sanity: ARM64 Image magic "ARM\x64" at offset 0x38.
+    magic=$(dd if="$IMAGES/kernel.tmp" bs=1 skip=56 count=4 2>/dev/null)
+    [ "$magic" = "ARMd" ] || { echo "extracted kernel lacks ARM64 Image magic" >&2; exit 1; }
 else
+    # x86_64: vmlinuz-virt is a bzImage, which Cloud Hypervisor boots directly.
     cp "$KSRC" "$IMAGES/kernel.tmp"
 fi
-# Sanity: ARM64 Image magic "ARM\x64" at offset 0x38.
-magic=$(dd if="$IMAGES/kernel.tmp" bs=1 skip=56 count=4 2>/dev/null)
-[ "$magic" = "ARMd" ] || { echo "extracted kernel lacks ARM64 Image magic" >&2; exit 1; }
 mv "$IMAGES/kernel.tmp" "$IMAGES/kernel"
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 # vsock + virtiofs modules out of the modloop squashfs (gzipped .ko.gz).
-unsquashfs -q -n -d "$WORK/modloop" "$CACHE/modloop-virt-$VER" \
+unsquashfs -q -n -d "$WORK/modloop" "$CACHE/modloop-virt-$VER-$ARCH" \
     'modules/*/kernel/net/vmw_vsock/*' 'modules/*/kernel/fs/fuse/*' > /dev/null
 VSOCKDIR=$(echo "$WORK"/modloop/modules/*/kernel/net/vmw_vsock)
 FUSEDIR=$(echo "$WORK"/modloop/modules/*/kernel/fs/fuse)
@@ -68,7 +80,7 @@ FUSEDIR=$(echo "$WORK"/modloop/modules/*/kernel/fs/fuse)
 # Rootfs: Alpine minirootfs + our init + staged modules.
 ROOT="$WORK/rootfs"
 mkdir -p "$ROOT"
-tar -xzf "$CACHE/minirootfs-$VER.tar.gz" -C "$ROOT"
+tar -xzf "$CACHE/minirootfs-$VER-$ARCH.tar.gz" -C "$ROOT"
 cp "$GUEST_AGENT" "$ROOT/init"
 chmod 755 "$ROOT/init"
 

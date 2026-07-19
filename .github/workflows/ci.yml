@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build + unit tests + Linux-target compile check on macOS.
+  # GitHub's macOS runners are themselves VMs without nested virtualization,
+  # so the microVM e2e suite cannot run here — it runs on Linux below and on
+  # developer Macs via scripts/e2e-test.sh.
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo check --workspace --target aarch64-unknown-linux-musl
+      - run: cargo build -p agentos-guest-agent --release --target aarch64-unknown-linux-musl
+      - name: Build vmhelper (Swift)
+        run: ./scripts/build-vmhelper.sh
+
+  # Full e2e on Linux: GitHub's Ubuntu runners expose /dev/kvm, so this job
+  # boots real Cloud Hypervisor microVMs through the whole stack.
+  linux-e2e:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Enable KVM for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Install Cloud Hypervisor + virtiofsd + image tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y virtiofsd squashfs-tools cpio
+          curl -fsSL -o /usr/local/bin/cloud-hypervisor \
+            https://github.com/cloud-hypervisor/cloud-hypervisor/releases/latest/download/cloud-hypervisor-static
+          chmod +x /usr/local/bin/cloud-hypervisor
+          # Debian installs virtiofsd outside PATH.
+          sudo ln -sf /usr/lib/qemu/virtiofsd /usr/local/bin/virtiofsd 2>/dev/null || true
+          sudo ln -sf /usr/libexec/virtiofsd /usr/local/bin/virtiofsd 2>/dev/null || true
+          cloud-hypervisor --version
+          virtiofsd --version
+
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+      - run: cargo build -p agentos-guest-agent --release --target x86_64-unknown-linux-musl
+      - name: Build guest image
+        run: ./scripts/build-guest-image.sh
+      - name: End-to-end microVM tests
+        run: ./scripts/e2e-test.sh
+      - name: Daemon log on failure
+        if: failure()
+        run: cat ~/.agentos/agentosd.log 2>/dev/null || true

@@ -1,5 +1,9 @@
-# Cross-compile the guest agent to a fully static aarch64 musl binary using
-# rust-lld, so no external cross toolchain is needed on macOS hosts.
+# Cross-compile the guest agent to a fully static musl binary using rust-lld,
+# so no external cross toolchain is needed on any host.
 [target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes"]
+
+[target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes"]

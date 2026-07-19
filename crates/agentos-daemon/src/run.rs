@@ -100,12 +100,16 @@ async fn drive(
     let sandbox_dir = home.join("sandboxes").join(id.to_string());
     std::fs::create_dir_all(&sandbox_dir)?;
 
+    let backend = agentos_vmm::default_backend()?;
+
     // Egress proxy (unless offline: then there is no egress path at all).
+    // The socket location is the backend's call: guest-initiated vsock
+    // connections must land on it (CH's hybrid vsock names it by convention).
     let egress_bytes = Arc::new(AtomicU64::new(0));
     let (proxy_socket, proxy_task) = if matches!(spec.net, NetPolicy::Offline) {
         (None, None)
     } else {
-        let path = sandbox_dir.join("proxy.sock");
+        let path = backend.proxy_socket_path(&sandbox_dir);
         let policy = spec.net.clone();
         let bytes = egress_bytes.clone();
         let sock = path.clone();
@@ -126,7 +130,6 @@ async fn drive(
     };
 
     // Boot.
-    let backend = agentos_vmm::default_backend()?;
     info!(%id, backend = backend.name(), "booting microVM");
     let mut handle = backend.create(&spec, &paths).await?;
     registry.set_state(id, SandboxState::Booting).await;
