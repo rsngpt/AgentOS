@@ -82,7 +82,7 @@ trait VmHandle {
 
 | OS | Backend | Rationale |
 |---|---|---|
-| macOS | **Virtualization.framework** via `objc2-virtualization` | Apple-blessed API with first-class virtio-fs, vsock, and Rosetta; no kext, works on Apple Silicon + Intel; App Store–compatible entitlement (`com.apple.security.virtualization`). |
+| macOS | **Virtualization.framework**, hosted in a small Swift helper (`vmhelper/`) spawned per sandbox | Apple-blessed API with first-class virtio-fs and vsock; no kext. The helper *is* the VM process — it boots the guest and relays the vsock control stream over its stdio — which makes kill-by-SIGKILL trivial and keeps the Objective-C surface out of the Rust core. Signed with the `com.apple.security.virtualization` entitlement. |
 | Linux | **Cloud Hypervisor** (child process, driven over its REST API socket) | Firecracker was rejected because it has no virtio-fs — our mount model requires it. Cloud Hypervisor is KVM-based, boots in hundreds of ms, and supports virtio-fs via an external `virtiofsd`. |
 | Windows | **Stub** (`Unsupported` error) | Future path: WHP-based backend, or reusing the Linux backend inside a WSL2 utility VM. Deferred until macOS + Linux are proven. |
 
@@ -90,7 +90,7 @@ The trait is deliberately narrow: the daemon never learns backend specifics, and
 
 ## 5. Guest Image & Boot Flow
 
-- **One shared, versioned rootfs image** (Alpine-based, < 100 MB): busybox userland, Python 3, Node.js, git, and `agentos-guest-agent` as `/init`. Shipped read-only in `~/.agentos/images/`.
+- **One shared, versioned guest image** (Alpine-based) in `~/.agentos/images/`, built by `scripts/build-guest-image.sh`. M1 ships it as an initramfs (minirootfs + `agentos-guest-agent` as `/init` + the vsock kernel modules, since Alpine's virt kernel builds them `=m`); M2 grows it into a rootfs disk with Python 3, Node.js, and git. The Alpine kernel arrives as an EFI-zboot PE, which the build script unwraps to the raw ARM64 Image that `VZLinuxBootLoader` requires.
 - **Per-sandbox writable overlay**: a sparse raw disk mounted as the upper layer of an overlayfs. "Wipe" deletes it; "save for debugging" keeps it and it can be re-inspected or re-attached.
 - **Boot path to < 2 s**: direct kernel boot (no bootloader, no initramfs beyond the embedded init), minimal virtual device set, `virtio-blk` root, guest-agent as PID 1 (no init system). Cloud Hypervisor and Virtualization.framework both do direct kernel boot in the 200–800 ms range; the budget is boot ≤ 1 s + guest-agent handshake ≤ 200 ms.
 - Kernel: a pinned minimal `Image`/`vmlinux` built with virtio + overlayfs + vsock only, shipped alongside the rootfs.
@@ -142,7 +142,7 @@ Provisioning → Booting → Running → Exited
 
 ## 11. Milestone Roadmap
 
-- **M1 — "Hello, sandbox" (macOS)**: `agentos run -- echo hi` boots a microVM via Virtualization.framework, streams stdio, exits, wipes. Boot-time budget proven here.
+- **M1 — "Hello, sandbox" (macOS)**: ✅ done. `agentos run -- echo hi` boots a microVM via Virtualization.framework, streams stdio, exits, wipes; `agentos ps`/`kill` work. Measured: ~0.8 s from spawn to guest exit (boot ≈ 60 ms).
 - **M2 — Policy**: virtio-fs mounts (RO/RW), egress proxy with all three network modes, kill switch (save|wipe), quotas + auto-kill. This is the PRD's MVP feature bar.
 - **M3 — Linux backend**: Cloud Hypervisor implementation of `VmmBackend`; CI proving both backends against one integration-test suite.
 - **M4 — GUI**: Tauri desktop app over the same JSON-RPC socket — sandbox list, permission editor, live terminal, network monitor, big red Terminate button.

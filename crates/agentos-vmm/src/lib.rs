@@ -21,12 +21,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub struct SandboxPaths {
     /// Per-sandbox scratch dir, e.g. `~/.agentos/sandboxes/<id>/`.
     pub sandbox_dir: PathBuf,
-    /// Shared read-only guest kernel image.
+    /// Shared read-only guest kernel image (uncompressed ARM64/x86 Image).
     pub kernel: PathBuf,
-    /// Shared read-only rootfs image.
-    pub rootfs: PathBuf,
-    /// This sandbox's writable overlay disk.
-    pub overlay: PathBuf,
+    /// Shared initramfs containing the guest agent as /init.
+    pub initramfs: PathBuf,
+    /// This sandbox's writable overlay disk (M2+; unused in M1).
+    pub overlay: Option<PathBuf>,
 }
 
 /// Coarse VM run state as observed from the host.
@@ -75,7 +75,7 @@ pub trait VmHandle: Send + Sync {
     fn stats(&self) -> Result<VmStats>;
 
     /// Connect to a vsock port inside the guest (control or proxy channel).
-    async fn connect_vsock(&self, port: u32) -> Result<VsockStream>;
+    async fn connect_vsock(&mut self, port: u32) -> Result<VsockStream>;
 
     /// The kill switch: destroy the VMM process immediately (SIGKILL-grade).
     /// Must be absolute — no graceful shutdown, nothing the guest can delay.

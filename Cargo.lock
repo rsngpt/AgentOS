@@ -40,6 +40,8 @@ name = "agentos-guest-agent"
 version = "0.1.0"
 dependencies = [
  "agentos-core",
+ "libc",
+ "serde_json",
 ]
 
 [[package]]
@@ -48,6 +50,7 @@ version = "0.1.0"
 dependencies = [
  "agentos-core",
  "async-trait",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
