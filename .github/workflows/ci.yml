@@ -52,13 +52,14 @@ jobs:
       - name: Install Cloud Hypervisor + virtiofsd + image tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y virtiofsd squashfs-tools cpio
+          # Ubuntu's virtiofsd (1.10) predates --readonly, which our host-side
+          # RO enforcement requires — build a current one from crates.io.
+          sudo apt-get install -y squashfs-tools cpio libseccomp-dev libcap-ng-dev
+          cargo install virtiofsd --locked
+          sudo ln -sf "$HOME/.cargo/bin/virtiofsd" /usr/local/bin/virtiofsd
           curl -fsSL -o /usr/local/bin/cloud-hypervisor \
             https://github.com/cloud-hypervisor/cloud-hypervisor/releases/latest/download/cloud-hypervisor-static
-          chmod +x /usr/local/bin/cloud-hypervisor
-          # Debian installs virtiofsd outside PATH.
-          sudo ln -sf /usr/lib/qemu/virtiofsd /usr/local/bin/virtiofsd 2>/dev/null || true
-          sudo ln -sf /usr/libexec/virtiofsd /usr/local/bin/virtiofsd 2>/dev/null || true
+          sudo chmod +x /usr/local/bin/cloud-hypervisor
           cloud-hypervisor --version
           virtiofsd --version
 

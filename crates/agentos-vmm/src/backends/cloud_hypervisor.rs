@@ -111,9 +111,21 @@ impl VmmBackend for CloudHypervisorBackend {
                 sock.display()
             ));
         }
-        // vhost-user needs the socket to exist before CH starts.
+        // vhost-user needs the socket to exist before CH starts. If a
+        // virtiofsd died instead, surface its own words.
         for (i, _) in spec.mounts.iter().enumerate() {
-            wait_for_path(&dir.join(format!("fs{i}.sock")), Duration::from_secs(3)).await?;
+            if let Err(e) =
+                wait_for_path(&dir.join(format!("fs{i}.sock")), Duration::from_secs(3)).await
+            {
+                let log = std::fs::read_to_string(dir.join(format!("fs{i}.log")))
+                    .unwrap_or_default();
+                let log = log.trim();
+                return Err(Error::Backend(format!(
+                    "{e}{}{}",
+                    if log.is_empty() { "" } else { "; virtiofsd said: " },
+                    log.chars().take(300).collect::<String>()
+                )));
+            }
         }
 
         let cmdline = if cfg!(target_arch = "aarch64") {
