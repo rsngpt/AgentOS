@@ -62,6 +62,10 @@ impl Registry {
         }
     }
 
+    pub async fn get_state(&self, id: &SandboxId) -> Option<SandboxState> {
+        self.inner.lock().await.get(id).map(|sb| sb.state.clone())
+    }
+
     pub async fn list(&self) -> Vec<(SandboxId, String, SandboxState)> {
         self.inner
             .lock()

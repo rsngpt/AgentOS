@@ -98,7 +98,11 @@ pub async fn run(spec: SandboxSpec) -> Result<i32, String> {
                 return Ok(v["code"].as_i64().unwrap_or(1) as i32);
             }
             Some("terminated") => {
-                eprintln!("sandbox terminated (kill switch)");
+                let reason = v["reason"].as_str().unwrap_or("kill switch");
+                eprintln!("sandbox terminated ({reason})");
+                if let Some(dir) = v["saved_dir"].as_str() {
+                    eprintln!("sandbox state saved at {dir}");
+                }
                 return Ok(137);
             }
             Some("error") => {

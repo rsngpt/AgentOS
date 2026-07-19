@@ -1,15 +1,22 @@
-//! Resource monitor & auto-kill (milestone M2).
+//! Resource monitor & auto-kill.
 //!
-//! A per-sandbox sampling loop combines host-truth VMM stats
-//! (`VmHandle::stats`), guest-advisory metrics (`GuestMessage::Metrics`),
-//! and proxy egress counters, emits `EventKind::ResourceSample`, and fires
-//! the kill switch when an `AutoKillRules` threshold is crossed.
+//! One `watch` task per running sandbox samples guest-reported memory
+//! (advisory), proxy egress byte counters (host truth), and wall-clock
+//! runtime, and fires the kill switch when an `AutoKillRules` threshold is
+//! crossed. The task is aborted by the run orchestration when the sandbox
+//! terminates.
 
-use agentos_core::AutoKillRules;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use agentos_core::{AutoKillRules, SandboxId, TerminationDisposition};
+use tracing::warn;
+
+use crate::registry::Registry;
 
 /// Evaluate rules against one sample. Returns the name of the rule that
 /// fired, if any — recorded in the event log and the `Killed` state.
-#[allow(dead_code)] // called from the M2 monitor loop; exercised by tests today
 pub fn breached_rule(
     rules: &AutoKillRules,
     mem_mib: u32,
@@ -26,6 +33,37 @@ pub fn breached_rule(
         return Some("max_runtime_secs");
     }
     None
+}
+
+/// Sample once a second; kill through the registry (the same absolute path
+/// as the manual kill switch) when a rule fires.
+pub async fn watch(
+    registry: Registry,
+    id: SandboxId,
+    rules: AutoKillRules,
+    guest_mem_mib: Arc<AtomicU32>,
+    egress_bytes: Arc<AtomicU64>,
+) {
+    if rules == AutoKillRules::default() {
+        return; // nothing to enforce
+    }
+    let started = Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mem = guest_mem_mib.load(Ordering::Relaxed);
+        let egress_mib = egress_bytes.load(Ordering::Relaxed) / (1024 * 1024);
+        let runtime = started.elapsed().as_secs();
+        if let Some(rule) = breached_rule(&rules, mem, egress_mib, runtime) {
+            warn!(%id, rule, mem, egress_mib, runtime, "auto-kill rule fired");
+            if let Err(e) = registry
+                .kill(&id, &format!("auto-kill: {rule}"), TerminationDisposition::Wipe)
+                .await
+            {
+                warn!(%id, error = %e, "auto-kill failed");
+            }
+            return;
+        }
+    }
 }
 
 #[cfg(test)]

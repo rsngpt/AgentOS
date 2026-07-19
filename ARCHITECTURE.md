@@ -143,7 +143,7 @@ Provisioning → Booting → Running → Exited
 ## 11. Milestone Roadmap
 
 - **M1 — "Hello, sandbox" (macOS)**: ✅ done. `agentos run -- echo hi` boots a microVM via Virtualization.framework, streams stdio, exits, wipes; `agentos ps`/`kill` work. Measured: ~0.8 s from spawn to guest exit (boot ≈ 60 ms).
-- **M2 — Policy**: virtio-fs mounts (RO/RW), egress proxy with all three network modes, kill switch (save|wipe), quotas + auto-kill. This is the PRD's MVP feature bar.
+- **M2 — Policy**: ✅ done. virtio-fs mounts (RO/RW, host-enforced — a root guest remounting rw still cannot write), egress proxy with all three network modes (localhost/LAN blocked even in `full`, DNS resolved host-side with local-address filtering), kill switch save|wipe dispositions, and auto-kill on memory/egress/runtime with incremental egress counting. This is the PRD's MVP feature bar.
 - **M3 — Linux backend**: Cloud Hypervisor implementation of `VmmBackend`; CI proving both backends against one integration-test suite.
 - **M4 — GUI**: Tauri desktop app over the same JSON-RPC socket — sandbox list, permission editor, live terminal, network monitor, big red Terminate button.
 - **Later**: Windows backend, enterprise fleet policy, snapshotting, prebuilt agent templates (per PRD §7).

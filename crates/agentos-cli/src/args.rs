@@ -68,6 +68,10 @@ pub struct RunArgs {
     #[arg(long, value_name = "MIB")]
     pub kill_over_egress: Option<u32>,
 
+    /// Auto-kill after this many seconds of runtime.
+    #[arg(long, value_name = "SECS")]
+    pub kill_after_secs: Option<u64>,
+
     /// Pass an environment variable into the guest: KEY=VALUE. Repeatable.
     #[arg(long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -116,7 +120,7 @@ impl RunArgs {
             auto_kill: AutoKillRules {
                 max_mem_mib: self.kill_over_mem,
                 max_egress_mib: self.kill_over_egress,
-                max_runtime_secs: None,
+                max_runtime_secs: self.kill_after_secs,
             },
         })
     }

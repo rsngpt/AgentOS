@@ -18,6 +18,12 @@
 import Foundation
 import Virtualization
 
+struct MountConfig: Codable {
+    var tag: String
+    var host_path: String
+    var read_only: Bool
+}
+
 struct HelperConfig: Codable {
     var kernel: String
     var initramfs: String
@@ -26,6 +32,12 @@ struct HelperConfig: Codable {
     var mem_mib: UInt64
     var vsock_port: UInt32
     var console_log: String
+    /// virtio-fs shares; read_only is enforced here, host-side.
+    var mounts: [MountConfig]?
+    /// When set, guest connections to vsock port `proxy_port` are bridged to
+    /// this Unix socket (the daemon's per-sandbox egress proxy).
+    var proxy_socket: String?
+    var proxy_port: UInt32?
 }
 
 func fail(_ msg: String) -> Never {
@@ -64,6 +76,17 @@ vmConfig.memorySize = max(VZVirtualMachineConfiguration.minimumAllowedMemorySize
 // vsock is the guest's only I/O channel: no network device is ever attached.
 vmConfig.socketDevices = [VZVirtioSocketDeviceConfiguration()]
 vmConfig.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
+// virtio-fs shares. Read-only is enforced by VZSharedDirectory on the host:
+// nothing the (root-privileged) guest does can upgrade its access.
+var fsDevices: [VZDirectorySharingDeviceConfiguration] = []
+for m in config.mounts ?? [] {
+    let dev = VZVirtioFileSystemDeviceConfiguration(tag: m.tag)
+    let dir = VZSharedDirectory(url: URL(fileURLWithPath: m.host_path), readOnly: m.read_only)
+    dev.share = VZSingleDirectoryShare(directory: dir)
+    fsDevices.append(dev)
+}
+vmConfig.directorySharingDevices = fsDevices
 
 // Guest console -> log file (for debugging boot problems).
 FileManager.default.createFile(atPath: config.console_log, contents: nil)
@@ -125,6 +148,74 @@ vm.delegate = delegate
     }
 }
 
+/// Bridges guest-initiated vsock connections (egress proxy traffic) to the
+/// daemon's per-sandbox Unix socket. One UDS connection per guest connection.
+final class ProxyBridge: NSObject, VZVirtioSocketListenerDelegate {
+    let udsPath: String
+    init(udsPath: String) { self.udsPath = udsPath }
+
+    func listener(
+        _ listener: VZVirtioSocketListener,
+        shouldAcceptNewConnection connection: VZVirtioSocketConnection,
+        from socketDevice: VZVirtioSocketDevice
+    ) -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let ok = udsPath.withCString { cstr -> Bool in
+            withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+                let n = strlen(cstr)
+                guard n < raw.count else { return false }
+                raw.baseAddress!.copyMemory(from: cstr, byteCount: n + 1)
+                return true
+            }
+        }
+        guard ok else { close(fd); return false }
+        let rc = withUnsafePointer(to: &addr) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard rc == 0 else {
+            note("proxy bridge: cannot reach daemon socket \(udsPath)")
+            close(fd)
+            return false
+        }
+        // dup the vsock fd so the connection object's lifetime doesn't matter.
+        let vfd = dup(connection.fileDescriptor)
+        connection.close()
+        Thread.detachNewThread {
+            relayLoop(vfd, fd)
+            shutdown(fd, SHUT_WR)
+        }
+        Thread.detachNewThread {
+            relayLoop(fd, vfd)
+            shutdown(vfd, SHUT_WR)
+            // Both directions done when the reverse thread also exits; closing
+            // here after our direction guarantees no fd leak per connection.
+            close(fd)
+            close(vfd)
+        }
+        return true
+    }
+}
+
+var proxyBridge: ProxyBridge? // must outlive the VM
+var proxyListener: VZVirtioSocketListener?
+
+func installProxyListener() {
+    guard let udsPath = config.proxy_socket, let port = config.proxy_port else { return }
+    guard let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else { return }
+    let bridge = ProxyBridge(udsPath: udsPath)
+    let listener = VZVirtioSocketListener()
+    listener.delegate = bridge
+    socketDevice.setSocketListener(listener, forPort: port)
+    proxyBridge = bridge
+    proxyListener = listener
+    note("proxy bridge on vsock port \(port) -> \(udsPath)")
+}
+
 func connectVsock(attempt: Int) {
     guard let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else {
         fail("no vsock device on running VM")
@@ -152,6 +243,7 @@ queue.async {
         switch result {
         case .success:
             note("VM running")
+            installProxyListener()
             connectVsock(attempt: 1)
         case .failure(let error):
             fail("VM failed to start: \(error)")

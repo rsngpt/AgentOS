@@ -57,11 +57,13 @@ mv "$IMAGES/kernel.tmp" "$IMAGES/kernel"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-# vsock modules out of the modloop squashfs (they are gzipped .ko.gz).
+# vsock + virtiofs modules out of the modloop squashfs (gzipped .ko.gz).
 unsquashfs -q -n -d "$WORK/modloop" "$CACHE/modloop-virt-$VER" \
-    'modules/*/kernel/net/vmw_vsock/*' > /dev/null
-MODDIR=$(echo "$WORK"/modloop/modules/*/kernel/net/vmw_vsock)
-[ -d "$MODDIR" ] || { echo "vsock modules not found in modloop" >&2; exit 1; }
+    'modules/*/kernel/net/vmw_vsock/*' 'modules/*/kernel/fs/fuse/*' > /dev/null
+VSOCKDIR=$(echo "$WORK"/modloop/modules/*/kernel/net/vmw_vsock)
+FUSEDIR=$(echo "$WORK"/modloop/modules/*/kernel/fs/fuse)
+[ -d "$VSOCKDIR" ] || { echo "vsock modules not found in modloop" >&2; exit 1; }
+[ -d "$FUSEDIR" ] || { echo "fuse modules not found in modloop" >&2; exit 1; }
 
 # Rootfs: Alpine minirootfs + our init + staged modules.
 ROOT="$WORK/rootfs"
@@ -71,16 +73,23 @@ cp "$GUEST_AGENT" "$ROOT/init"
 chmod 755 "$ROOT/init"
 
 mkdir -p "$ROOT/lib/modules/agentos"
-for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
-    if [ -f "$MODDIR/$m.ko.gz" ]; then
-        gunzip -c "$MODDIR/$m.ko.gz" > "$ROOT/lib/modules/agentos/$m.ko"
-    elif [ -f "$MODDIR/$m.ko" ]; then
-        cp "$MODDIR/$m.ko" "$ROOT/lib/modules/agentos/$m.ko"
+stage_module() { # stage_module <srcdir> <name>
+    if [ -f "$1/$2.ko.gz" ]; then
+        gunzip -c "$1/$2.ko.gz" > "$ROOT/lib/modules/agentos/$2.ko"
+    elif [ -f "$1/$2.ko" ]; then
+        cp "$1/$2.ko" "$ROOT/lib/modules/agentos/$2.ko"
     else
-        echo "missing module $m in $MODDIR" >&2; exit 1
+        echo "missing module $2 in $1" >&2; exit 1
     fi
-    echo "$m.ko"
-done > "$ROOT/lib/modules/agentos/order"
+    echo "$2.ko"
+}
+{
+    stage_module "$VSOCKDIR" vsock
+    stage_module "$VSOCKDIR" vmw_vsock_virtio_transport_common
+    stage_module "$VSOCKDIR" vmw_vsock_virtio_transport
+    stage_module "$FUSEDIR" fuse
+    stage_module "$FUSEDIR" virtiofs
+} > "$ROOT/lib/modules/agentos/order"
 
 # Pack as newc cpio, everything owned by root.
 (cd "$ROOT" && find . | cpio -o --format newc -R 0:0 --quiet | gzip -1) \

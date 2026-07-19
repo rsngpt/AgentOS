@@ -25,8 +25,17 @@ pub struct SandboxPaths {
     pub kernel: PathBuf,
     /// Shared initramfs containing the guest agent as /init.
     pub initramfs: PathBuf,
-    /// This sandbox's writable overlay disk (M2+; unused in M1).
+    /// This sandbox's writable overlay disk (M3+; unused today).
     pub overlay: Option<PathBuf>,
+    /// Unix socket of the daemon's egress proxy for this sandbox. `None`
+    /// under `NetPolicy::Offline`: the guest then has no egress path at all.
+    pub proxy_socket: Option<PathBuf>,
+}
+
+/// virtio-fs share tag for the i-th mount in a `SandboxSpec` (the daemon and
+/// the backend must agree on this naming).
+pub fn share_tag(index: usize) -> String {
+    format!("share{index}")
 }
 
 /// Coarse VM run state as observed from the host.

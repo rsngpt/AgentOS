@@ -26,8 +26,13 @@ cargo build -p agentos-guest-agent --release --target aarch64-unknown-linux-musl
 ./scripts/build-guest-image.sh     # Alpine kernel + initramfs -> ~/.agentos/images
 
 ./target/debug/agentos run -- echo hi          # boots a real microVM (~1s)
+./target/debug/agentos run \
+    --mount ./project:rw --mount /data/corpus \
+    --net allowlist:api.openai.com \
+    --kill-over-egress 512 --kill-after-secs 3600 \
+    -- python3 agent.py
 ./target/debug/agentos ps
-./target/debug/agentos kill <id>               # the kill switch
+./target/debug/agentos kill <id>               # the kill switch (--save keeps logs)
 ```
 
-Status: **M1 complete** — real microVMs on macOS with stdio streaming and the kill switch. Next: M2 (mounts, network policy, quotas); see ARCHITECTURE.md §11.
+Status: **M2 complete** — mounts (RO enforced host-side), egress policy proxy (offline / allowlist / full, LAN+localhost always blocked), quotas with auto-kill, save|wipe dispositions. Next: M3 (Linux backend); see ARCHITECTURE.md §11.

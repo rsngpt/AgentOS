@@ -1,20 +1,26 @@
 //! Orchestration of one sandbox run: provision → boot → handshake → exec →
-//! stream → reap → wipe. Emits JSON-line events to the connected client.
+//! stream → reap → dispose. Emits JSON-line events to the connected client.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use agentos_core::protocol::{GuestMessage, HostMessage, PROTOCOL_VERSION};
-use agentos_core::{Error, Result, SandboxSpec, SandboxState, GUEST_CONTROL_PORT};
-use agentos_vmm::SandboxPaths;
+use agentos_core::{
+    Error, NetPolicy, Result, SandboxSpec, SandboxState, TerminationDisposition,
+    GUEST_CONTROL_PORT,
+};
+use agentos_vmm::{share_tag, SandboxPaths};
 use serde_json::json;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::frames;
+use crate::monitor;
+use crate::proxy;
 use crate::registry::Registry;
+use crate::frames;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -45,7 +51,8 @@ pub async fn run_sandbox(
                     &id,
                     SandboxState::Killed {
                         reason: format!("error: {e}"),
-                        disposition: Default::default(),
+                        // Keep the sandbox dir (console/helper logs) on errors.
+                        disposition: TerminationDisposition::Save,
                     },
                 )
                 .await;
@@ -61,10 +68,10 @@ fn agentos_home() -> PathBuf {
 async fn drive(
     registry: &Registry,
     id: &agentos_core::SandboxId,
-    spec: SandboxSpec,
+    mut spec: SandboxSpec,
     client: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
-    // Provision.
+    // Provision: images present, mount sources valid.
     let home = agentos_home();
     let images = home.join("images");
     let kernel = images.join("kernel");
@@ -77,13 +84,45 @@ async fn drive(
             )));
         }
     }
+    for m in &mut spec.mounts {
+        let canon = m.host_path.canonicalize().map_err(|e| {
+            Error::InvalidSpec(format!("mount {}: {e}", m.host_path.display()))
+        })?;
+        if !canon.is_dir() {
+            return Err(Error::InvalidSpec(format!(
+                "mount {} is not a directory",
+                canon.display()
+            )));
+        }
+        m.host_path = canon;
+    }
+
     let sandbox_dir = home.join("sandboxes").join(id.to_string());
     std::fs::create_dir_all(&sandbox_dir)?;
+
+    // Egress proxy (unless offline: then there is no egress path at all).
+    let egress_bytes = Arc::new(AtomicU64::new(0));
+    let (proxy_socket, proxy_task) = if matches!(spec.net, NetPolicy::Offline) {
+        (None, None)
+    } else {
+        let path = sandbox_dir.join("proxy.sock");
+        let policy = spec.net.clone();
+        let bytes = egress_bytes.clone();
+        let sock = path.clone();
+        let task = tokio::spawn(async move {
+            if let Err(e) = proxy::serve(&sock, policy, bytes).await {
+                tracing::warn!(error = %e, "egress proxy stopped");
+            }
+        });
+        (Some(path), Some(task))
+    };
+
     let paths = SandboxPaths {
         sandbox_dir: sandbox_dir.clone(),
         kernel,
         initramfs,
         overlay: None,
+        proxy_socket,
     };
 
     // Boot.
@@ -118,12 +157,24 @@ async fn drive(
     }
 
     // Exec.
+    let exec_mounts = spec
+        .mounts
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            (
+                share_tag(i),
+                m.guest_path.to_string_lossy().into_owned(),
+                m.mode == agentos_core::MountMode::ReadOnly,
+            )
+        })
+        .collect();
     frames::write_host_frame(
         &mut stream,
         &HostMessage::Exec {
             command: spec.command.clone(),
             env: spec.env.clone(),
-            mounts: vec![], // M2: virtio-fs shares
+            mounts: exec_mounts,
             net: spec.net.clone(),
         },
     )
@@ -132,6 +183,17 @@ async fn drive(
     emit(client, json!({ "event": "running" }))
         .await
         .map_err(Error::Io)?;
+
+    // Auto-kill monitor: samples guest memory (advisory, updated from
+    // Metrics frames below), proxy egress bytes, and wall-clock runtime.
+    let guest_mem = Arc::new(AtomicU32::new(0));
+    let monitor_task = tokio::spawn(monitor::watch(
+        registry.clone(),
+        id.clone(),
+        spec.auto_kill,
+        guest_mem.clone(),
+        egress_bytes.clone(),
+    ));
 
     // Stream until Exited or EOF.
     let mut exit_info = None;
@@ -147,24 +209,30 @@ async fn drive(
                     .await
                     .map_err(Error::Io)?;
             }
+            GuestMessage::Metrics { mem_mib, .. } => {
+                guest_mem.store(mem_mib, Ordering::Relaxed);
+            }
             GuestMessage::Exited { info } => {
                 exit_info = Some(info);
                 break;
             }
-            GuestMessage::Hello { .. } | GuestMessage::Metrics { .. } => {}
+            GuestMessage::Hello { .. } => {}
         }
     }
+    monitor_task.abort();
 
     // Reap the VMM child (guest powers off after Exited; EOF means it died
     // or was killed).
     let vmm_exit = shared.lock().await.wait().await;
+    if let Some(t) = proxy_task {
+        t.abort();
+    }
     info!(%id, ?exit_info, ?vmm_exit, "sandbox finished");
 
     match exit_info {
         Some(info) => {
             registry.set_state(id, SandboxState::Exited { info }).await;
-            // Default disposition: wipe. Nothing of the sandbox survives.
-            std::fs::remove_dir_all(&sandbox_dir).ok();
+            std::fs::remove_dir_all(&sandbox_dir).ok(); // normal exit: wipe
             emit(
                 client,
                 json!({ "event": "exited", "code": info.code, "signal": info.signal }),
@@ -173,10 +241,30 @@ async fn drive(
             .map_err(Error::Io)?;
         }
         None => {
-            // EOF without Exited: killed (state already set by kill()) or crashed.
-            emit(client, json!({ "event": "terminated" }))
-                .await
-                .map_err(Error::Io)?;
+            // EOF without Exited: the kill switch fired (manual or auto).
+            let (reason, disposition) = match registry.get_state(id).await {
+                Some(SandboxState::Killed { reason, disposition }) => (reason, disposition),
+                _ => ("vmm died".to_string(), TerminationDisposition::Save),
+            };
+            match disposition {
+                TerminationDisposition::Wipe => {
+                    std::fs::remove_dir_all(&sandbox_dir).ok();
+                }
+                TerminationDisposition::Save => {
+                    info!(%id, dir = %sandbox_dir.display(), "sandbox state saved");
+                }
+            }
+            emit(
+                client,
+                json!({
+                    "event": "terminated",
+                    "reason": reason,
+                    "saved_dir": matches!(disposition, TerminationDisposition::Save)
+                        .then(|| sandbox_dir.display().to_string()),
+                }),
+            )
+            .await
+            .map_err(Error::Io)?;
         }
     }
     Ok(())

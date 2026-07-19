@@ -143,9 +143,11 @@ mod linux {
         }
 
         // Wait for Exec.
-        let (command, env) = loop {
+        let (command, env, mounts, net) = loop {
             match read_frame(&mut reader)? {
-                HostMessage::Exec { command, env, .. } => break (command, env),
+                HostMessage::Exec { command, env, mounts, net } => {
+                    break (command, env, mounts, net)
+                }
                 HostMessage::Hello { .. } => continue,
                 HostMessage::Stdin { .. } => continue, // no child yet
                 HostMessage::Terminate => return Ok(()),
@@ -154,10 +156,26 @@ mod linux {
         if command.is_empty() {
             return Err(other_err("empty command".into()));
         }
-        log(&format!("exec: {command:?}"));
 
+        mount_shares(&mounts);
+
+        // Networking: the guest has no NIC. When policy allows egress, run a
+        // local forwarder (loopback TCP -> vsock to the host's policy proxy)
+        // and point proxy env vars at it. Offline: neither exists.
+        let mut proxy_env: Vec<(String, String)> = Vec::new();
+        if !matches!(net, agentos_core::NetPolicy::Offline) {
+            bring_up_loopback();
+            std::thread::spawn(proxy_forwarder);
+            let url = format!("http://127.0.0.1:{PROXY_LISTEN_PORT}");
+            for k in ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"] {
+                proxy_env.push((k.to_string(), url.clone()));
+            }
+        }
+
+        log(&format!("exec: {command:?}"));
         let mut child = Command::new(&command[0])
             .args(&command[1..])
+            .envs(proxy_env)
             .envs(env.iter().map(|(k, v)| (k, v)))
             .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
             .stdin(Stdio::piped())
@@ -166,9 +184,15 @@ mod linux {
             .spawn()
             .map_err(|e| other_err(format!("spawn {:?}: {e}", command[0])))?;
 
-        // Three pumps feed one outgoing channel: stdout frames, stderr frames,
-        // and the reader thread forwarding Stdin/Terminate to the child.
+        // All frames out through one writer thread; producers: stdout pump,
+        // stderr pump, metrics ticker, and finally main sending Exited.
         let (tx, rx) = mpsc::channel::<GuestMessage>();
+        let t_writer = std::thread::spawn(move || -> std::io::Result<std::fs::File> {
+            for msg in rx {
+                write_frame(&mut writer, &msg)?;
+            }
+            Ok(writer)
+        });
 
         let mut child_stdin = child.stdin.take();
         let stdout = child.stdout.take().unwrap();
@@ -178,7 +202,26 @@ mod linux {
         let t_out = std::thread::spawn(move || pump(stdout, tx_out, true));
         let tx_err = tx.clone();
         let t_err = std::thread::spawn(move || pump(stderr, tx_err, false));
-        drop(tx);
+
+        let metrics_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let tx = tx.clone();
+            let stop = metrics_stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if tx
+                        .send(GuestMessage::Metrics {
+                            mem_mib: mem_used_mib(),
+                            disk_used_mib: 0,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            });
+        }
 
         // Host → child stdin, on its own thread so we can block on frames.
         std::thread::spawn(move || {
@@ -199,14 +242,11 @@ mod linux {
             }
         });
 
-        // Forward output frames until both pumps finish.
-        for msg in rx {
-            write_frame(&mut writer, &msg)?;
-        }
         t_out.join().ok();
         t_err.join().ok();
-
         let status = child.wait()?;
+        metrics_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
         #[allow(clippy::useless_conversion)]
         let info = {
             use std::os::unix::process::ExitStatusExt;
@@ -215,8 +255,138 @@ mod linux {
                 signal: status.signal(),
             }
         };
-        write_frame(&mut writer, &GuestMessage::Exited { info })?;
-        Ok(())
+        tx.send(GuestMessage::Exited { info }).ok();
+        drop(tx); // last live producer besides metrics (which checks send errors)
+        match t_writer.join() {
+            Ok(Ok(_writer)) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(other_err("writer thread panicked".into())),
+        }
+    }
+
+    /// Mount virtio-fs shares announced in Exec: (tag, guest_path, read_only).
+    /// Read-only is *also* enforced host-side; the guest flag is belt-and-braces.
+    fn mount_shares(mounts: &[(String, String, bool)]) {
+        for (tag, guest_path, read_only) in mounts {
+            std::fs::create_dir_all(guest_path).ok();
+            let src = std::ffi::CString::new(tag.as_str()).unwrap();
+            let target = std::ffi::CString::new(guest_path.as_str()).unwrap();
+            let fstype = c"virtiofs";
+            let flags = if *read_only { libc::MS_RDONLY } else { 0 };
+            let rc = unsafe {
+                libc::mount(src.as_ptr(), target.as_ptr(), fstype.as_ptr(), flags, std::ptr::null())
+            };
+            if rc != 0 {
+                log(&format!(
+                    "mount virtiofs {tag} -> {guest_path}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            } else {
+                log(&format!("mounted {tag} -> {guest_path} (ro={read_only})"));
+            }
+        }
+    }
+
+    /// Guest-side loopback port the proxy env vars point at.
+    const PROXY_LISTEN_PORT: u16 = 3128;
+
+    fn bring_up_loopback() {
+        // SIOCSIFFLAGS on "lo": IFF_UP | IFF_RUNNING.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+            if fd < 0 {
+                return;
+            }
+            let mut ifr: libc::ifreq = std::mem::zeroed();
+            for (i, b) in b"lo\0".iter().enumerate() {
+                ifr.ifr_name[i] = *b as libc::c_char;
+            }
+            if libc::ioctl(fd, libc::SIOCGIFFLAGS as libc::c_int, &mut ifr) == 0 {
+                ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+                libc::ioctl(fd, libc::SIOCSIFFLAGS as libc::c_int, &ifr);
+            }
+            libc::close(fd);
+        }
+    }
+
+    /// Accept loopback TCP connections and pipe each to a fresh vsock
+    /// connection to the host's egress proxy. Dumb pipe: all policy and HTTP
+    /// parsing happens host-side, where the guest can't touch it.
+    fn proxy_forwarder() {
+        let listener = match std::net::TcpListener::bind(("127.0.0.1", PROXY_LISTEN_PORT)) {
+            Ok(l) => l,
+            Err(e) => {
+                log(&format!("proxy listener bind: {e}"));
+                return;
+            }
+        };
+        log(&format!("proxy forwarder on 127.0.0.1:{PROXY_LISTEN_PORT}"));
+        for conn in listener.incoming() {
+            let Ok(tcp) = conn else { continue };
+            std::thread::spawn(move || {
+                let host = match vsock_connect_host(agentos_core::HOST_PROXY_PORT) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        log(&format!("proxy vsock connect: {e}"));
+                        return;
+                    }
+                };
+                let mut host_r = unsafe { std::fs::File::from_raw_fd(dup(&host).unwrap_or(-1)) };
+                let mut host_w = unsafe { std::fs::File::from_raw_fd(dup(&host).unwrap_or(-1)) };
+                let mut tcp_r = tcp.try_clone().expect("clone tcp");
+                let mut tcp_w = tcp;
+                let t = std::thread::spawn(move || {
+                    std::io::copy(&mut tcp_r, &mut host_w).ok();
+                    // half-close towards host so responses can still drain
+                    unsafe { libc::shutdown(host_w.as_raw_fd(), libc::SHUT_WR) };
+                });
+                std::io::copy(&mut host_r, &mut tcp_w).ok();
+                tcp_w.shutdown(std::net::Shutdown::Write).ok();
+                t.join().ok();
+            });
+        }
+    }
+
+    fn vsock_connect_host(port: u32) -> std::io::Result<OwnedFd> {
+        let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let addr = libc::sockaddr_vm {
+            svm_family: libc::AF_VSOCK as libc::sa_family_t,
+            svm_reserved1: 0,
+            svm_port: port,
+            svm_cid: libc::VMADDR_CID_HOST,
+            svm_zero: [0; 4],
+        };
+        let rc = unsafe {
+            libc::connect(
+                fd.as_raw_fd(),
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(fd)
+    }
+
+    /// Used memory in MiB from /proc/meminfo (MemTotal - MemAvailable).
+    fn mem_used_mib() -> u32 {
+        let Ok(s) = std::fs::read_to_string("/proc/meminfo") else {
+            return 0;
+        };
+        let field = |name: &str| -> u64 {
+            s.lines()
+                .find(|l| l.starts_with(name))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        };
+        let used_kib = field("MemTotal:").saturating_sub(field("MemAvailable:"));
+        (used_kib / 1024) as u32
     }
 
     /// Read a child output stream and emit protocol frames.

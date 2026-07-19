@@ -74,6 +74,19 @@ impl super::super::VmmBackend for VzBackend {
             )));
         }
 
+        let mounts: Vec<serde_json::Value> = spec
+            .mounts
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                serde_json::json!({
+                    "tag": super::super::share_tag(i),
+                    "host_path": m.host_path,
+                    "read_only": m.mode == agentos_core::MountMode::ReadOnly,
+                })
+            })
+            .collect();
+
         let config = serde_json::json!({
             "kernel": paths.kernel,
             "initramfs": paths.initramfs,
@@ -82,6 +95,9 @@ impl super::super::VmmBackend for VzBackend {
             "mem_mib": spec.limits.mem_mib,
             "vsock_port": GUEST_CONTROL_PORT,
             "console_log": paths.sandbox_dir.join("console.log"),
+            "mounts": mounts,
+            "proxy_socket": paths.proxy_socket,
+            "proxy_port": paths.proxy_socket.as_ref().map(|_| agentos_core::HOST_PROXY_PORT),
         });
         let config_path = paths.sandbox_dir.join("vmconfig.json");
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
