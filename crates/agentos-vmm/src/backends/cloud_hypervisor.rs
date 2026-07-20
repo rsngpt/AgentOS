@@ -140,7 +140,11 @@ impl VmmBackend for CloudHypervisorBackend {
             format!("size={}M,shared=on", spec.limits.mem_mib)
         };
 
+        let api_socket = dir.join("api.sock");
         let mut args: Vec<String> = vec![
+            // Control channel for pause/resume (ch-remote talks to this).
+            "--api-socket".into(),
+            api_socket.display().to_string(),
             "--kernel".into(),
             paths.kernel.display().to_string(),
             "--initramfs".into(),
@@ -194,6 +198,8 @@ impl VmmBackend for CloudHypervisorBackend {
             child,
             virtiofsds,
             vsock,
+            api_socket,
+            ch_remote: bin_from_env("CH_REMOTE", "ch-remote"),
         }))
     }
 }
@@ -202,6 +208,28 @@ pub struct ChVmHandle {
     child: Child,
     virtiofsds: Vec<Child>,
     vsock: PathBuf,
+    api_socket: PathBuf,
+    ch_remote: PathBuf,
+}
+
+impl ChVmHandle {
+    /// Drive the VM through `ch-remote` against this VM's API socket.
+    async fn ch_remote(&self, verb: &str) -> Result<()> {
+        let out = Command::new(&self.ch_remote)
+            .arg("--api-socket")
+            .arg(&self.api_socket)
+            .arg(verb)
+            .output()
+            .await
+            .map_err(|e| Error::Backend(format!("running {} {verb}: {e}", self.ch_remote.display())))?;
+        if !out.status.success() {
+            return Err(Error::Backend(format!(
+                "ch-remote {verb} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -227,6 +255,14 @@ impl VmHandle for ChVmHandle {
             "guest never accepted vsock port {port} via {}",
             self.vsock.display()
         )))
+    }
+
+    async fn pause(&mut self) -> Result<()> {
+        self.ch_remote("pause").await
+    }
+
+    async fn resume(&mut self) -> Result<()> {
+        self.ch_remote("resume").await
     }
 
     async fn kill(&mut self) -> Result<()> {

@@ -125,6 +125,19 @@ do {
     fail("invalid VM configuration: \(error)")
 }
 
+// Report whether this configuration supports save/restore (snapshotting).
+// Not all device combinations do, and the API only tells us at runtime.
+#if arch(arm64)
+if #available(macOS 14.0, *) {
+    do {
+        try vmConfig.validateSaveRestoreSupport()
+        note("save/restore: SUPPORTED for this configuration")
+    } catch {
+        note("save/restore: UNSUPPORTED — \(error)")
+    }
+}
+#endif
+
 // --- Boot and relay ---------------------------------------------------------
 
 final class Delegate: NSObject, VZVirtualMachineDelegate {
@@ -258,6 +271,42 @@ func connectVsock(attempt: Int) {
         }
     }
 }
+
+// Pause/resume are driven by signals rather than a control message, because
+// our stdio is already dedicated to relaying the guest's vsock stream.
+// SIGUSR1 = pause, SIGUSR2 = resume. Dispatch sources run the handler on the
+// VM queue, which is where Virtualization.framework requires these calls.
+signal(SIGUSR1, SIG_IGN)
+signal(SIGUSR2, SIG_IGN)
+let pauseSource = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: queue)
+pauseSource.setEventHandler {
+    guard vm.canPause else {
+        note("pause ignored: VM cannot pause in state \(vm.state.rawValue)")
+        return
+    }
+    vm.pause { result in
+        switch result {
+        case .success: note("paused")
+        case .failure(let e): note("pause failed: \(e)")
+        }
+    }
+}
+pauseSource.resume()
+
+let resumeSource = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: queue)
+resumeSource.setEventHandler {
+    guard vm.canResume else {
+        note("resume ignored: VM cannot resume in state \(vm.state.rawValue)")
+        return
+    }
+    vm.resume { result in
+        switch result {
+        case .success: note("resumed")
+        case .failure(let e): note("resume failed: \(e)")
+        }
+    }
+}
+resumeSource.resume()
 
 queue.async {
     vm.start { result in

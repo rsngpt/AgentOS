@@ -84,6 +84,36 @@ echo "== auto-kill: runtime =="
 "$AGENTOS" run --kill-after-secs 3 -- sleep 60 >/dev/null 2>&1
 check "runtime auto-kill exit code" "137" "$?"
 
+echo "== pause/resume: vCPUs freeze and continue where they left off =="
+"$AGENTOS" run -- sh -c 'i=0; while [ $i -lt 60 ]; do echo "t$i"; i=$((i+1)); sleep 1; done' \
+    > /tmp/agentos-e2e-ticks.txt 2>&1 &
+ticker=$!
+sleep 6
+id=$("$AGENTOS" ps | awk '$3=="running"{print $1; exit}')
+if [ -n "$id" ]; then
+    "$AGENTOS" pause "$id" >/dev/null 2>&1
+    check "state is paused" "paused" "$("$AGENTOS" ps | awk -v i="$id" '$1==i{print $3}')"
+    before=$(wc -l < /tmp/agentos-e2e-ticks.txt)
+    sleep 4
+    after=$(wc -l < /tmp/agentos-e2e-ticks.txt)
+    check "guest is frozen while paused" "$before" "$after"
+    "$AGENTOS" resume "$id" >/dev/null 2>&1
+    sleep 4
+    resumed=$(wc -l < /tmp/agentos-e2e-ticks.txt)
+    if [ "$resumed" -gt "$after" ]; then
+        echo "PASS: guest advances again after resume"
+    else
+        echo "FAIL: guest did not advance after resume ($after -> $resumed)" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+    "$AGENTOS" kill "$id" >/dev/null 2>&1
+    wait "$ticker" 2>/dev/null
+else
+    echo "FAIL: pause/resume — no running sandbox found" >&2
+    kill "$ticker" 2>/dev/null
+    FAILURES=$((FAILURES + 1))
+fi
+
 echo "== kill switch: save disposition =="
 "$AGENTOS" run -- sleep 60 >/dev/null 2>&1 &
 runner=$!

@@ -9,6 +9,9 @@ license.workspace = true
 agentos-core.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

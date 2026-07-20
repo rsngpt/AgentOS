@@ -97,6 +97,59 @@ impl Registry {
             .collect()
     }
 
+    /// Freeze or unfreeze a sandbox's vCPUs (PRD §7 pause mid-task).
+    /// Only legal from the matching live state; terminal sandboxes refuse.
+    pub async fn set_paused(&self, id: &SandboxId, paused: bool) -> Result<()> {
+        let handle = {
+            let guard = self.inner.lock().await;
+            let sb = guard
+                .get(id)
+                .ok_or_else(|| Error::UnknownSandbox(id.clone()))?;
+            let ok = if paused {
+                matches!(sb.state, SandboxState::Running)
+            } else {
+                matches!(sb.state, SandboxState::Paused)
+            };
+            if !ok {
+                return Err(Error::InvalidState {
+                    id: id.clone(),
+                    state: format!("{:?}", sb.state),
+                    reason: if paused {
+                        "only a running sandbox can be paused".into()
+                    } else {
+                        "only a paused sandbox can be resumed".into()
+                    },
+                });
+            }
+            sb.handle.clone()
+        };
+        let handle = handle.ok_or_else(|| Error::InvalidState {
+            id: id.clone(),
+            state: "no vm".into(),
+            reason: "sandbox has no running VM".into(),
+        })?;
+
+        // Drive the hypervisor first: only record the new state if it worked.
+        {
+            let mut h = handle.lock().await;
+            if paused {
+                h.pause().await?;
+            } else {
+                h.resume().await?;
+            }
+        }
+        self.set_state(
+            id,
+            if paused {
+                SandboxState::Paused
+            } else {
+                SandboxState::Running
+            },
+        )
+        .await;
+        Ok(())
+    }
+
     /// The kill switch: SIGKILL the VMM child. Absolute and immediate.
     pub async fn kill(
         &self,

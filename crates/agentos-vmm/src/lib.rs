@@ -93,6 +93,14 @@ pub trait VmHandle: Send + Sync {
     /// Connect to a vsock port inside the guest (control or proxy channel).
     async fn connect_vsock(&mut self, port: u32) -> Result<VsockStream>;
 
+    /// Freeze the guest's vCPUs (PRD §7 "pause an agent mid-task"). The vsock
+    /// control stream simply stops producing frames — no protocol change — so
+    /// the daemon's run task waits until the VM resumes.
+    async fn pause(&mut self) -> Result<()>;
+
+    /// Unfreeze a paused guest.
+    async fn resume(&mut self) -> Result<()>;
+
     /// The kill switch: destroy the VMM process immediately (SIGKILL-grade).
     /// Must be absolute — no graceful shutdown, nothing the guest can delay.
     async fn kill(&mut self) -> Result<()>;

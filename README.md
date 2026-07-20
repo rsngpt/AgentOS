@@ -34,6 +34,8 @@ cargo build -p agentos-guest-agent --release --target aarch64-unknown-linux-musl
     --kill-over-egress 512 --kill-after-secs 3600 \
     -- python3 agent.py
 ./target/debug/agentos ps
+./target/debug/agentos pause <id>              # freeze an agent mid-task
+./target/debug/agentos resume <id>             # continue where it left off
 ./target/debug/agentos kill <id>               # the kill switch (--save keeps logs)
 ./target/debug/agentos events                  # stream the daemon event bus
 ./target/debug/agentos-gui                     # desktop app (Tauri)

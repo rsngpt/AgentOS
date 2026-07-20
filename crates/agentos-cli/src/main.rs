@@ -44,6 +44,18 @@ async fn main() {
                 println!("killed");
                 0
             }),
+        Command::Pause { id } => client::unary("sandbox.pause", json!({ "id": id }))
+            .await
+            .map(|_| {
+                println!("paused");
+                0
+            }),
+        Command::Resume { id } => client::unary("sandbox.resume", json!({ "id": id }))
+            .await
+            .map(|_| {
+                println!("resumed");
+                0
+            }),
         Command::Events => client::events().await,
     };
 

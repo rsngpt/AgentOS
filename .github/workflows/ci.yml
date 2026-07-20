@@ -59,8 +59,12 @@ jobs:
           sudo ln -sf "$HOME/.cargo/bin/virtiofsd" /usr/local/bin/virtiofsd
           curl -fsSL -o /usr/local/bin/cloud-hypervisor \
             https://github.com/cloud-hypervisor/cloud-hypervisor/releases/latest/download/cloud-hypervisor-static
-          sudo chmod +x /usr/local/bin/cloud-hypervisor
+          # ch-remote drives the API socket for pause/resume.
+          curl -fsSL -o /usr/local/bin/ch-remote \
+            https://github.com/cloud-hypervisor/cloud-hypervisor/releases/latest/download/ch-remote-static
+          sudo chmod +x /usr/local/bin/cloud-hypervisor /usr/local/bin/ch-remote
           cloud-hypervisor --version
+          ch-remote --version
           virtiofsd --version
 
       # GUI excluded: tauri needs webkit2gtk dev packages; the desktop app is

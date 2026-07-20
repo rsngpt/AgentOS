@@ -152,7 +152,18 @@ Provisioning → Booting → Running → Exited
 - **M2 — Policy**: ✅ done. virtio-fs mounts (RO/RW, host-enforced — a root guest remounting rw still cannot write), egress proxy with all three network modes (localhost/LAN blocked even in `full`, DNS resolved host-side with local-address filtering), kill switch save|wipe dispositions, and auto-kill on memory/egress/runtime with incremental egress counting. This is the PRD's MVP feature bar.
 - **M3 — Linux backend**: ✅ done, CI-verified. `CloudHypervisorBackend` spawns `cloud-hypervisor` (hybrid vsock, no NIC, one unprivileged `virtiofsd --sandbox none` per mount with host-side `--readonly` — virtiofsd ≥ 1.11 required; the backend fails closed, quoting virtiofsd's stderr, rather than ever running an RO mount unenforced); guest-initiated egress lands on the `<vsock_socket>_1025` Unix socket where the daemon binds its proxy (`VmmBackend::proxy_socket_path`). The shared e2e suite (`scripts/e2e-test.sh`, 11 assertions) passes on macOS/vz locally and on real KVM Cloud Hypervisor microVMs in CI (`.github/workflows/ci.yml`).
 - **M4 — GUI**: ✅ done. Tauri desktop app (`gui/`, vanilla static frontend — no npm toolchain) over the same socket as the CLI, via the shared `agentos-client` crate: sandbox list with live states, permission form (mounts/net/limits/auto-kill), streaming terminal, network monitor fed by the daemon's event bus (`events.subscribe` broadcasts `StateChanged`/`NetVerdict`/`ResourceSample`/`AutoKillTriggered`), and per-sandbox Terminate / kill+save buttons. `agentos events` streams the same bus in the CLI.
-- **Later**: Windows backend, enterprise fleet policy, snapshotting, prebuilt agent templates (per PRD §7).
+- **Later**: Windows backend, enterprise fleet policy (per PRD §7).
+
+## 12. Snapshotting (PRD §7)
+
+Split into two halves with very different costs:
+
+- **Pause/resume mid-task — done.** `agentos pause|resume <id>` freezes and unfreezes the guest's vCPUs via `VmHandle::pause`/`resume`: SIGUSR1/SIGUSR2 to the vmhelper on macOS (its stdio is already dedicated to relaying vsock, so signals are the free control channel), and `ch-remote pause|resume` against a per-VM `--api-socket` on Linux. No protocol change was needed — a frozen guest simply stops producing vsock frames, so the daemon's run task waits and the agent resumes exactly where it left off. The registry only permits `Running → Paused → Running`, and terminal sandboxes refuse both.
+- **Save-to-disk and restore later — not done.** Two obstacles, both worth stating plainly:
+  1. *Reconnect protocol.* The control plane holds a live vsock connection for a run's lifetime. Restoring into a fresh daemon needs a handshake the design lacks: the guest agent must notice the dead session and re-listen, and the daemon must reattach the stdio stream.
+  2. *"Share with a colleague" is not achievable on macOS.* `saveMachineStateTo` produces a file "protected by an encryption key tied to the host on which it is created", restorable only on that same host. Sharing would have to be rebuilt from the overlay disk plus the spec — i.e. restarting, not resuming. Cloud Hypervisor's snapshots carry no such host-key restriction, so the two backends would mean different things by "share", which the CLI would have to surface honestly.
+
+  The macOS half is otherwise viable: `VZVirtualMachineConfiguration.validateSaveRestoreSupport` confirms our exact device set (virtio-fs + vsock + two virtio-blk disks) is savable, and the vmhelper logs that verdict at boot. Save/restore is arm64-only and needs macOS 14+.
 
 ## 12. PRD Requirement Traceability
 

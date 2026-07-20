@@ -79,6 +79,7 @@ version = "0.1.0"
 dependencies = [
  "agentos-core",
  "async-trait",
+ "libc",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",

@@ -131,6 +131,21 @@ impl super::super::VmmBackend for VzBackend {
     }
 }
 
+impl VzVmHandle {
+    /// The helper turns SIGUSR1/SIGUSR2 into VZVirtualMachine pause/resume.
+    fn signal_helper(&self, sig: libc::c_int, what: &str) -> Result<()> {
+        let pid = self
+            .child
+            .id()
+            .ok_or_else(|| Error::Backend(format!("cannot {what}: VM already exited")))?;
+        // Safe: pid is our own live child, reaped only by this handle.
+        if unsafe { libc::kill(pid as libc::pid_t, sig) } != 0 {
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+}
+
 pub struct VzVmHandle {
     child: Child,
     /// The helper's stdio, which *is* the guest's control-port vsock stream.
@@ -159,6 +174,14 @@ impl super::super::VmHandle for VzVmHandle {
             .take()
             .ok_or_else(|| Error::Backend("control stream already taken".into()))?;
         Ok(Box::new(HelperPipe { stdin, stdout }))
+    }
+
+    async fn pause(&mut self) -> Result<()> {
+        self.signal_helper(libc::SIGUSR1, "pause")
+    }
+
+    async fn resume(&mut self) -> Result<()> {
+        self.signal_helper(libc::SIGUSR2, "resume")
     }
 
     async fn kill(&mut self) -> Result<()> {

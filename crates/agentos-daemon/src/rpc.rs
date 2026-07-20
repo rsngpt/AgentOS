@@ -87,6 +87,20 @@ async fn unary(req: &Request, registry: &Registry) -> Result<Value, String> {
             .into_iter()
             .map(|(id, name, state)| json!({ "id": id, "name": name, "state": state }))
             .collect::<Vec<_>>())),
+        "sandbox.pause" | "sandbox.resume" => {
+            #[derive(Deserialize)]
+            struct IdParam {
+                id: SandboxId,
+            }
+            let p: IdParam = serde_json::from_value(req.params.clone())
+                .map_err(|e| format!("invalid params: {e}"))?;
+            let pause = req.method == "sandbox.pause";
+            registry
+                .set_paused(&p.id, pause)
+                .await
+                .map(|_| json!({ "paused": pause }))
+                .map_err(|e| e.to_string())
+        }
         "sandbox.kill" => {
             #[derive(Deserialize)]
             struct KillParams {

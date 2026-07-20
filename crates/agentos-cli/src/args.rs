@@ -33,6 +33,16 @@ pub enum Command {
         #[arg(long)]
         save: bool,
     },
+    /// Freeze a running sandbox's vCPUs, keeping its VM and grants intact.
+    Pause {
+        /// Sandbox id (from `agentos ps`).
+        id: String,
+    },
+    /// Resume a paused sandbox exactly where it left off.
+    Resume {
+        /// Sandbox id (from `agentos ps`).
+        id: String,
+    },
     /// Stream daemon events (state changes, network verdicts, resource samples).
     Events,
 }

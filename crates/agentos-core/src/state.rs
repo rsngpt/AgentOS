@@ -20,6 +20,9 @@ pub enum SandboxState {
     Booting,
     /// Guest agent handshake complete; agent command executing.
     Running,
+    /// vCPUs frozen via `agentos pause`. The sandbox still holds its VM and
+    /// grants; `resume` continues exactly where it left off.
+    Paused,
     /// The guest command exited on its own.
     Exited { info: ExitInfo },
     /// Terminated via the kill switch (manual or auto-kill rule).
