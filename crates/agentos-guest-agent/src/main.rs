@@ -374,7 +374,16 @@ mod linux {
 
         let lower_owned = lower.to_string();
         let mut cmd = Command::new("/sbin/mkfs.ext4");
-        cmd.args(["-F", "-q", "-E", "lazy_itable_init=1,lazy_journal_init=1", dev])
+        // nodiscard: some VMMs (Cloud Hypervisor over a raw file) error the
+        // TRIM/DISCARD that mkfs issues first, which cascades into failed
+        // writes. We don't need discard on a fresh throwaway disk.
+        cmd.args([
+            "-F",
+            "-q",
+            "-E",
+            "lazy_itable_init=1,lazy_journal_init=1,nodiscard",
+            dev,
+        ])
             .env("PATH", "/sbin:/usr/sbin:/bin:/usr/bin")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
