@@ -17,6 +17,9 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
+// Run carries the whole flag surface; the other variants are tiny. Boxing an
+// `Args` variant isn't supported by clap's derive, so accept the size gap.
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// Boot a sandbox and run a command in it, attached to its stdio.
     Run(RunArgs),
@@ -53,6 +56,11 @@ pub struct RunArgs {
     /// Branch/tag/commit to check out with --repo (default branch otherwise).
     #[arg(long = "branch", value_name = "REF", requires = "repo")]
     pub branch: Option<String>,
+
+    /// Starter environment presetting a network allowlist for its ecosystem:
+    /// python, node, or github. An explicit --net overrides it.
+    #[arg(long = "template", value_name = "NAME")]
+    pub template: Option<String>,
 
     /// Network policy: offline (default), full, or allowlist:host1,host2.
     /// Localhost and LAN destinations are always blocked.
@@ -99,7 +107,19 @@ impl RunArgs {
             .iter()
             .map(|m| MountSpec::parse(m))
             .collect::<Result<Vec<_>>>()?;
-        let net = NetPolicy::parse(&self.net)?;
+        // A template presets the network allowlist; an explicit --net wins.
+        // Resolve the template regardless so an unknown name is rejected.
+        let net = match &self.template {
+            Some(t) => {
+                let template_net = agentos_core::template_net(t)?;
+                if self.net == "offline" {
+                    template_net
+                } else {
+                    NetPolicy::parse(&self.net)?
+                }
+            }
+            None => NetPolicy::parse(&self.net)?,
+        };
         let env = self
             .env
             .iter()
@@ -217,6 +237,32 @@ mod tests {
     #[test]
     fn branch_requires_repo() {
         assert!(Cli::try_parse_from(["agentos", "run", "--branch", "dev", "--", "make"]).is_err());
+    }
+
+    #[test]
+    fn template_presets_net_allowlist() {
+        let spec = parse_run(&["agentos", "run", "--template", "python", "--", "pip", "install", "x"])
+            .into_spec()
+            .unwrap();
+        match spec.net {
+            NetPolicy::Allowlist(hosts) => assert!(hosts.iter().any(|h| h == "pypi.org")),
+            other => panic!("expected allowlist, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_net_overrides_template() {
+        let spec = parse_run(&["agentos", "run", "--template", "python", "--net", "full", "--", "x"])
+            .into_spec()
+            .unwrap();
+        assert_eq!(spec.net, NetPolicy::Full);
+    }
+
+    #[test]
+    fn unknown_template_rejected() {
+        assert!(parse_run(&["agentos", "run", "--template", "cobol", "--", "x"])
+            .into_spec()
+            .is_err());
     }
 
     #[test]

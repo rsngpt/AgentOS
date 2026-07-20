@@ -189,6 +189,26 @@ pub struct RepoSpec {
 /// Guest path the cloned repo is mounted at (and the command's working dir).
 pub const REPO_GUEST_PATH: &str = "/workspace";
 
+/// Named starter environments (PRD §7): each presets a network allowlist so
+/// the ecosystem's package tooling works without hand-writing `--net`. The
+/// runtimes themselves already ship in the guest rootfs.
+pub const TEMPLATES: &[(&str, &str)] = &[
+    ("python", "pypi.org, files.pythonhosted.org"),
+    ("node", "registry.npmjs.org"),
+    ("github", "github.com, *.github.com, codeload.github.com"),
+];
+
+/// The [`NetPolicy`] for a named template, or an error listing valid names.
+pub fn template_net(name: &str) -> Result<NetPolicy> {
+    match TEMPLATES.iter().find(|(n, _)| *n == name) {
+        Some((_, hosts)) => NetPolicy::parse(&format!("allowlist:{hosts}")),
+        None => Err(Error::InvalidSpec(format!(
+            "unknown template {name:?}; known: {}",
+            TEMPLATES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
 /// The complete, user-approved grant for one sandbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxSpec {
