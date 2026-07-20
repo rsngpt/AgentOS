@@ -166,18 +166,16 @@ impl VmmBackend for CloudHypervisorBackend {
         // overlay. Each value after --disk is one disk (CH parses them
         // independently); mark read/write explicitly. Keep vda/vdb order in
         // sync with the guest agent.
-        // Disks: vda = rootfs, vdb = overlay, as separate --disk flags.
-        // NOTE: `readonly=on` on the rootfs disk made the *overlay* unwritable
-        // on CH (write I/O errors on vdb) in every combination tried, so it's
-        // omitted for now. The rootfs is a squashfs (kernel can't write it) and
-        // the guest mounts it read-only; hardening /dev/vda against a hostile
-        // guest `dd` is a follow-up (per-sandbox rootfs copy or file-mode).
+        // Disks: vda = read-only rootfs, vdb = writable overlay.
+        // image_type=raw is REQUIRED: without it CH auto-detects raw but then
+        // "disables sector 0 writes" as a qcow2-misdetection safeguard, which
+        // makes mkfs.ext4's superblock write to the overlay fail ReadOnly.
         if let Some(rootfs) = &paths.rootfs {
             args.push("--disk".into());
-            args.push(format!("path={}", rootfs.display()));
+            args.push(format!("path={},image_type=raw,readonly=on", rootfs.display()));
             if let Some(overlay) = &paths.overlay {
                 args.push("--disk".into());
-                args.push(format!("path={}", overlay.display()));
+                args.push(format!("path={},image_type=raw", overlay.display()));
             }
         }
         tracing::info!(bin = %self.ch_bin.display(), ?args, "spawning cloud-hypervisor");
