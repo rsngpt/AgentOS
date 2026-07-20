@@ -87,6 +87,15 @@ impl super::super::VmmBackend for VzBackend {
             })
             .collect();
 
+        // Disks in order: vda = read-only runtime rootfs, vdb = writable overlay.
+        let mut disks: Vec<serde_json::Value> = Vec::new();
+        if let Some(rootfs) = &paths.rootfs {
+            disks.push(serde_json::json!({ "path": rootfs, "read_only": true }));
+            if let Some(overlay) = &paths.overlay {
+                disks.push(serde_json::json!({ "path": overlay, "read_only": false }));
+            }
+        }
+
         let config = serde_json::json!({
             "kernel": paths.kernel,
             "initramfs": paths.initramfs,
@@ -96,6 +105,7 @@ impl super::super::VmmBackend for VzBackend {
             "vsock_port": GUEST_CONTROL_PORT,
             "console_log": paths.sandbox_dir.join("console.log"),
             "mounts": mounts,
+            "disks": disks,
             "proxy_socket": paths.proxy_socket,
             "proxy_port": paths.proxy_socket.as_ref().map(|_| agentos_core::HOST_PROXY_PORT),
         });

@@ -51,6 +51,14 @@ ro-blocked" ] || { echo "  mount run stderr was:" >&2; sed 's/^/  /' /tmp/agento
 check "rw mount round-trips to host" "guest" "$(cat "$M/rw/out.txt" 2>/dev/null)"
 rm -rf "$M"
 
+echo "== runtimes: python3, node, git present in the guest rootfs =="
+out=$("$AGENTOS" run -- sh -c 'command -v python3 >/dev/null && command -v node >/dev/null && command -v git >/dev/null && echo runtimes-ok || echo missing' 2>/dev/null)
+check "python3+node+git available" "runtimes-ok" "$out"
+
+echo "== overlay: the agent root is writable (copy-up over the ro rootfs) =="
+out=$("$AGENTOS" run -- sh -c 'echo ok > /usr/agentos-write-test && cat /usr/agentos-write-test' 2>/dev/null)
+check "overlay makes the root writable" "ok" "$out"
+
 echo "== network: offline (default) =="
 out=$("$AGENTOS" run -- sh -c 'wget -T 5 -q -O- http://example.com >/dev/null 2>&1 && echo LEAK || echo blocked' 2>/dev/null)
 check "offline blocks egress" "blocked" "$out"

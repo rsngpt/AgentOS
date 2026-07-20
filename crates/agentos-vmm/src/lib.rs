@@ -25,7 +25,10 @@ pub struct SandboxPaths {
     pub kernel: PathBuf,
     /// Shared initramfs containing the guest agent as /init.
     pub initramfs: PathBuf,
-    /// This sandbox's writable overlay disk (M3+; unused today).
+    /// Shared read-only runtime rootfs (squashfs), attached as `/dev/vda`.
+    /// `None` falls the guest back to the initramfs (busybox only).
+    pub rootfs: Option<PathBuf>,
+    /// This sandbox's writable overlay disk, attached as `/dev/vdb`.
     pub overlay: Option<PathBuf>,
     /// Unix socket of the daemon's egress proxy for this sandbox. `None`
     /// under `NetPolicy::Offline`: the guest then has no egress path at all.

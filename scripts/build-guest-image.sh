@@ -1,13 +1,17 @@
 #!/bin/sh
 # Build the Agent OS guest image (works on macOS and Linux hosts):
 #   ~/.agentos/images/kernel            - Alpine linux-virt kernel
-#   ~/.agentos/images/initramfs.cpio.gz - Alpine minirootfs + agentos-guest-agent as /init
+#   ~/.agentos/images/initramfs.cpio.gz - agentos-guest-agent (PID 1) + kernel modules
+#   ~/.agentos/images/rootfs.squashfs   - read-only agent root: Alpine + python3,
+#                                         nodejs, npm, git, e2fsprogs (mkfs.ext4)
 #
-# The virt kernel ships vsock/virtiofs as modules, so the needed .ko files are
-# staged into the initramfs at /lib/modules/agentos and loaded by the guest agent.
+# The guest agent runs from the initramfs; per sandbox it mounts this squashfs
+# read-only, unions a writable overlay disk over it, and chroots the agent
+# command in. The virt kernel ships the needed filesystems as modules, staged
+# into the initramfs at /lib/modules/agentos and loaded by the guest agent.
 #
-# Requires: curl, cpio (bsdcpio or GNU), unsquashfs (brew install squashfs /
-# apt install squashfs-tools), python3, and a prior
+# Requires: curl, cpio (bsdcpio or GNU), unsquashfs + mksquashfs (brew install
+# squashfs / apt install squashfs-tools), python3, and a prior
 # `cargo build -p agentos-guest-agent --release --target <arch>-unknown-linux-musl`.
 #
 # Guest arch defaults to the host's; override with GUEST_ARCH=aarch64|x86_64.
@@ -69,13 +73,21 @@ mv "$IMAGES/kernel.tmp" "$IMAGES/kernel"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-# vsock + virtiofs modules out of the modloop squashfs (gzipped .ko.gz).
+# Kernel modules the guest agent loads: vsock (control + egress), virtiofs
+# (mounts), virtio_blk (root + overlay disks), and squashfs/ext4/overlay for
+# the rootfs-over-overlay union. Extract their subtrees from the modloop.
 unsquashfs -q -n -d "$WORK/modloop" "$CACHE/modloop-virt-$VER-$ARCH" \
-    'modules/*/kernel/net/vmw_vsock/*' 'modules/*/kernel/fs/fuse/*' > /dev/null
-VSOCKDIR=$(echo "$WORK"/modloop/modules/*/kernel/net/vmw_vsock)
-FUSEDIR=$(echo "$WORK"/modloop/modules/*/kernel/fs/fuse)
-[ -d "$VSOCKDIR" ] || { echo "vsock modules not found in modloop" >&2; exit 1; }
-[ -d "$FUSEDIR" ] || { echo "fuse modules not found in modloop" >&2; exit 1; }
+    'modules/*/kernel/net/vmw_vsock/*' \
+    'modules/*/kernel/fs/fuse/*' \
+    'modules/*/kernel/fs/squashfs/*' \
+    'modules/*/kernel/fs/overlayfs/*' \
+    'modules/*/kernel/fs/ext4/*' \
+    'modules/*/kernel/fs/jbd2/*' \
+    'modules/*/kernel/fs/mbcache.ko*' \
+    'modules/*/kernel/lib/crc/crc16.ko*' \
+    'modules/*/kernel/drivers/block/virtio_blk.ko*' > /dev/null
+MODTREE="$WORK/modloop/modules"
+[ -d "$MODTREE" ] || { echo "modloop extraction failed" >&2; exit 1; }
 
 # Rootfs: Alpine minirootfs + our init + staged modules.
 ROOT="$WORK/rootfs"
@@ -85,22 +97,29 @@ cp "$GUEST_AGENT" "$ROOT/init"
 chmod 755 "$ROOT/init"
 
 mkdir -p "$ROOT/lib/modules/agentos"
-stage_module() { # stage_module <srcdir> <name>
-    if [ -f "$1/$2.ko.gz" ]; then
-        gunzip -c "$1/$2.ko.gz" > "$ROOT/lib/modules/agentos/$2.ko"
-    elif [ -f "$1/$2.ko" ]; then
-        cp "$1/$2.ko" "$ROOT/lib/modules/agentos/$2.ko"
-    else
-        echo "missing module $2 in $1" >&2; exit 1
-    fi
-    echo "$2.ko"
+stage_module() { # stage_module <name> — locate <name>.ko[.gz] anywhere in the tree
+    src=$(find "$MODTREE" \( -name "$1.ko.gz" -o -name "$1.ko" \) | head -1)
+    [ -n "$src" ] || { echo "missing module $1 in modloop" >&2; exit 1; }
+    case "$src" in
+        *.gz) gunzip -c "$src" > "$ROOT/lib/modules/agentos/$1.ko" ;;
+        *)    cp "$src" "$ROOT/lib/modules/agentos/$1.ko" ;;
+    esac
+    echo "$1.ko"
 }
+# Order matters: transports before vsock users; ext4's deps before ext4.
 {
-    stage_module "$VSOCKDIR" vsock
-    stage_module "$VSOCKDIR" vmw_vsock_virtio_transport_common
-    stage_module "$VSOCKDIR" vmw_vsock_virtio_transport
-    stage_module "$FUSEDIR" fuse
-    stage_module "$FUSEDIR" virtiofs
+    stage_module vsock
+    stage_module vmw_vsock_virtio_transport_common
+    stage_module vmw_vsock_virtio_transport
+    stage_module fuse
+    stage_module virtiofs
+    stage_module virtio_blk
+    stage_module squashfs
+    stage_module crc16
+    stage_module mbcache
+    stage_module jbd2
+    stage_module ext4
+    stage_module overlay
 } > "$ROOT/lib/modules/agentos/order"
 
 # Pack as newc cpio, everything owned by root.
@@ -108,5 +127,19 @@ stage_module() { # stage_module <srcdir> <name>
     > "$IMAGES/initramfs.cpio.gz.tmp"
 mv "$IMAGES/initramfs.cpio.gz.tmp" "$IMAGES/initramfs.cpio.gz"
 
+# ---- Read-only agent rootfs: Alpine base + language runtimes -> squashfs ----
+ROOTFS="$WORK/rootfs-full"
+mkdir -p "$ROOTFS"
+tar -xzf "$CACHE/minirootfs-$VER-$ARCH.tar.gz" -C "$ROOTFS"
+python3 scripts/apk-fetch.py "$MIRROR" "$ARCH" "$ROOTFS" \
+    python3 py3-pip nodejs npm git e2fsprogs
+# Mount points and a placeholder resolv.conf (real DNS is host-side in the
+# egress proxy; direct guest DNS is intentionally impossible).
+mkdir -p "$ROOTFS/mnt" "$ROOTFS/proc" "$ROOTFS/sys" "$ROOTFS/dev" "$ROOTFS/etc"
+printf 'nameserver 127.0.0.1\n' > "$ROOTFS/etc/resolv.conf"
+mksquashfs "$ROOTFS" "$IMAGES/rootfs.squashfs.tmp" -noappend -quiet -comp xz
+mv "$IMAGES/rootfs.squashfs.tmp" "$IMAGES/rootfs.squashfs"
+
 echo "kernel:    $(ls -lh "$IMAGES/kernel" | awk '{print $5}')  $IMAGES/kernel"
 echo "initramfs: $(ls -lh "$IMAGES/initramfs.cpio.gz" | awk '{print $5}')  $IMAGES/initramfs.cpio.gz"
+echo "rootfs:    $(ls -lh "$IMAGES/rootfs.squashfs" | awk '{print $5}')  $IMAGES/rootfs.squashfs"

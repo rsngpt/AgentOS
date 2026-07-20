@@ -24,6 +24,11 @@ struct MountConfig: Codable {
     var read_only: Bool
 }
 
+struct DiskConfig: Codable {
+    var path: String
+    var read_only: Bool
+}
+
 struct HelperConfig: Codable {
     var kernel: String
     var initramfs: String
@@ -34,6 +39,8 @@ struct HelperConfig: Codable {
     var console_log: String
     /// virtio-fs shares; read_only is enforced here, host-side.
     var mounts: [MountConfig]?
+    /// virtio-blk disks in guest order (vda, vdb, …); rootfs is read-only.
+    var disks: [DiskConfig]?
     /// When set, guest connections to vsock port `proxy_port` are bridged to
     /// this Unix socket (the daemon's per-sandbox egress proxy).
     var proxy_socket: String?
@@ -87,6 +94,20 @@ for m in config.mounts ?? [] {
     fsDevices.append(dev)
 }
 vmConfig.directorySharingDevices = fsDevices
+
+// virtio-blk disks. Order determines guest device names (vda, vdb, …); the
+// guest agent expects vda=rootfs, vdb=overlay. Read-only enforced host-side.
+var blockDevices: [VZStorageDeviceConfiguration] = []
+for d in config.disks ?? [] {
+    do {
+        let attachment = try VZDiskImageStorageDeviceAttachment(
+            url: URL(fileURLWithPath: d.path), readOnly: d.read_only)
+        blockDevices.append(VZVirtioBlockDeviceConfiguration(attachment: attachment))
+    } catch {
+        fail("cannot attach disk \(d.path): \(error)")
+    }
+}
+vmConfig.storageDevices = blockDevices
 
 // Guest console -> log file (for debugging boot problems).
 FileManager.default.createFile(atPath: config.console_log, contents: nil)

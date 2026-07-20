@@ -33,6 +33,7 @@ fn main() {
 mod linux {
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
 
@@ -157,7 +158,12 @@ mod linux {
             return Err(other_err("empty command".into()));
         }
 
-        mount_shares(&mounts);
+        // Set up the agent root: with a rootfs disk present, union a writable
+        // overlay over the read-only runtime rootfs and chroot into it (so the
+        // command sees python3/node/git and can write anywhere); otherwise run
+        // in the initramfs. Shares mount under the chosen root.
+        let root = setup_overlay_root();
+        mount_shares(root.unwrap_or(""), &mounts);
 
         // Networking: the guest has no NIC. When policy allows egress, run a
         // local forwarder (loopback TCP -> vsock to the host's policy proxy)
@@ -172,15 +178,31 @@ mod linux {
             }
         }
 
-        log(&format!("exec: {command:?}"));
-        let mut child = Command::new(&command[0])
-            .args(&command[1..])
+        log(&format!("exec: {command:?} (root={})", root.unwrap_or("initramfs")));
+        let mut cmd = Command::new(&command[0]);
+        cmd.args(&command[1..])
             .envs(proxy_env)
             .envs(env.iter().map(|(k, v)| (k, v)))
             .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(newroot) = root {
+            // chroot into the union after fork, before exec. The stdio pipes
+            // and the loopback proxy (init's network namespace) survive it;
+            // PATH is then searched inside the new root, so `python3` resolves.
+            let newroot = newroot.to_string();
+            unsafe {
+                cmd.pre_exec(move || {
+                    let c = std::ffi::CString::new(newroot.as_str()).unwrap();
+                    if libc::chroot(c.as_ptr()) != 0 || libc::chdir(c"/".as_ptr()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| other_err(format!("spawn {:?}: {e}", command[0])))?;
 
@@ -264,25 +286,144 @@ mod linux {
         }
     }
 
-    /// Mount virtio-fs shares announced in Exec: (tag, guest_path, read_only).
+    /// Generic mount(2) wrapper. Returns false (and logs) on failure.
+    fn do_mount(
+        src: &str,
+        target: &str,
+        fstype: &str,
+        flags: libc::c_ulong,
+        data: Option<&str>,
+    ) -> bool {
+        let src_c = std::ffi::CString::new(src).unwrap();
+        let target_c = std::ffi::CString::new(target).unwrap();
+        let fstype_c = std::ffi::CString::new(fstype).unwrap();
+        let data_c = data.map(|d| std::ffi::CString::new(d).unwrap());
+        let data_ptr = data_c
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c.as_ptr() as *const libc::c_void);
+        let rc = unsafe {
+            libc::mount(src_c.as_ptr(), target_c.as_ptr(), fstype_c.as_ptr(), flags, data_ptr)
+        };
+        if rc != 0 {
+            log(&format!(
+                "mount {src} -> {target} ({fstype}): {}",
+                std::io::Error::last_os_error()
+            ));
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Build the agent's root filesystem for this run.
+    ///
+    /// The daemon attaches the shared runtime rootfs as `/dev/vda` (read-only
+    /// squashfs) and a fresh per-sandbox writable disk as `/dev/vdb`. We union
+    /// them with overlayfs and return the union path to chroot into. Writes go
+    /// to the overlay (copy-up), so `pip install` etc. work and never touch the
+    /// shared image. Returns `None` when no rootfs disk is present (the guest
+    /// then runs the command directly in the initramfs — enough for busybox).
+    fn setup_overlay_root() -> Option<&'static str> {
+        const LOWER: &str = "/lower";
+        const OVER: &str = "/over";
+        const ROOT: &str = "/newroot";
+
+        // virtio_blk was just loaded; give the device nodes a moment to appear.
+        let mut waited = 0;
+        while !std::path::Path::new("/dev/vda").exists() && waited < 40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            waited += 1;
+        }
+        if !std::path::Path::new("/dev/vda").exists() {
+            log("no rootfs disk (/dev/vda); running in the initramfs");
+            return None;
+        }
+        for d in [LOWER, OVER, ROOT] {
+            std::fs::create_dir_all(d).ok();
+        }
+        if !do_mount("/dev/vda", LOWER, "squashfs", libc::MS_RDONLY, None) {
+            return None;
+        }
+
+        if std::path::Path::new("/dev/vdb").exists() {
+            format_overlay(LOWER, "/dev/vdb");
+            if do_mount("/dev/vdb", OVER, "ext4", 0, None) {
+                std::fs::create_dir_all(format!("{OVER}/upper")).ok();
+                std::fs::create_dir_all(format!("{OVER}/work")).ok();
+                let opts = format!("lowerdir={LOWER},upperdir={OVER}/upper,workdir={OVER}/work");
+                if do_mount("overlay", ROOT, "overlay", 0, Some(&opts)) {
+                    mount_pseudo_into(ROOT);
+                    return Some(ROOT);
+                }
+            }
+        }
+        // No usable overlay: run on the read-only rootfs (runtimes present,
+        // writes limited to a tmpfs /tmp).
+        log("overlay disk unavailable; using read-only rootfs");
+        mount_pseudo_into(LOWER);
+        Some(LOWER)
+    }
+
+    /// Format the per-sandbox overlay disk ext4. mkfs.ext4 lives in the rootfs,
+    /// so run it chrooted there with a devtmpfs exposing the block node. Lazy
+    /// init keeps this well under a second even on a large sparse disk.
+    fn format_overlay(lower: &str, dev: &str) {
+        let devdir = format!("{lower}/dev");
+        std::fs::create_dir_all(&devdir).ok();
+        do_mount("devtmpfs", &devdir, "devtmpfs", 0, None);
+
+        let lower_owned = lower.to_string();
+        let mut cmd = Command::new("/sbin/mkfs.ext4");
+        cmd.args(["-F", "-q", "-E", "lazy_itable_init=1,lazy_journal_init=1", dev])
+            .env("PATH", "/sbin:/usr/sbin:/bin:/usr/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        unsafe {
+            cmd.pre_exec(move || {
+                let c = std::ffi::CString::new(lower_owned.as_str()).unwrap();
+                if libc::chroot(c.as_ptr()) != 0 || libc::chdir(c"/".as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => log(&format!("formatted {dev} ext4")),
+            Ok(o) => log(&format!(
+                "mkfs.ext4 failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )),
+            Err(e) => log(&format!("mkfs.ext4 spawn: {e}")),
+        }
+        let devdir_c = std::ffi::CString::new(devdir).unwrap();
+        unsafe { libc::umount(devdir_c.as_ptr()) };
+    }
+
+    /// Mount proc/sys/dev and a writable tmpfs /tmp under a chroot target.
+    fn mount_pseudo_into(root: &str) {
+        for (src, sub, fstype) in [
+            ("proc", "proc", "proc"),
+            ("sysfs", "sys", "sysfs"),
+            ("devtmpfs", "dev", "devtmpfs"),
+            ("tmpfs", "tmp", "tmpfs"),
+        ] {
+            let target = format!("{root}/{sub}");
+            std::fs::create_dir_all(&target).ok();
+            do_mount(src, &target, fstype, 0, None);
+        }
+    }
+
+    /// Mount virtio-fs shares announced in Exec: (tag, guest_path, read_only),
+    /// rooted under `root` (the chroot target, or "" for the initramfs).
     /// Read-only is *also* enforced host-side; the guest flag is belt-and-braces.
-    fn mount_shares(mounts: &[(String, String, bool)]) {
+    fn mount_shares(root: &str, mounts: &[(String, String, bool)]) {
         for (tag, guest_path, read_only) in mounts {
-            std::fs::create_dir_all(guest_path).ok();
-            let src = std::ffi::CString::new(tag.as_str()).unwrap();
-            let target = std::ffi::CString::new(guest_path.as_str()).unwrap();
-            let fstype = c"virtiofs";
+            let target = format!("{root}{guest_path}");
+            std::fs::create_dir_all(&target).ok();
             let flags = if *read_only { libc::MS_RDONLY } else { 0 };
-            let rc = unsafe {
-                libc::mount(src.as_ptr(), target.as_ptr(), fstype.as_ptr(), flags, std::ptr::null())
-            };
-            if rc != 0 {
-                log(&format!(
-                    "mount virtiofs {tag} -> {guest_path}: {}",
-                    std::io::Error::last_os_error()
-                ));
-            } else {
-                log(&format!("mounted {tag} -> {guest_path} (ro={read_only})"));
+            if do_mount(tag, &target, "virtiofs", flags, None) {
+                log(&format!("mounted {tag} -> {target} (ro={read_only})"));
             }
         }
     }

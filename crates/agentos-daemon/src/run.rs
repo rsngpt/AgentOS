@@ -101,6 +101,20 @@ async fn drive(
     let sandbox_dir = home.join("sandboxes").join(id.to_string());
     std::fs::create_dir_all(&sandbox_dir)?;
 
+    // Runtime rootfs (shared, read-only) + a fresh per-sandbox writable overlay
+    // disk sized to the disk quota. Optional: without the rootfs image the guest
+    // falls back to the initramfs (busybox only, no persistence).
+    let rootfs = images.join("rootfs.squashfs");
+    let (rootfs, overlay) = if rootfs.exists() {
+        let overlay = sandbox_dir.join("overlay.img");
+        let f = std::fs::File::create(&overlay)?;
+        // Sparse: allocates lazily, capped at the quota.
+        f.set_len(u64::from(spec.limits.disk_mib) * 1024 * 1024)?;
+        (Some(rootfs), Some(overlay))
+    } else {
+        (None, None)
+    };
+
     let backend = agentos_vmm::default_backend()?;
 
     // Egress proxy (unless offline: then there is no egress path at all).
@@ -128,7 +142,8 @@ async fn drive(
         sandbox_dir: sandbox_dir.clone(),
         kernel,
         initramfs,
-        overlay: None,
+        rootfs,
+        overlay,
         proxy_socket,
     };
 

@@ -41,4 +41,11 @@ cargo build -p agentos-guest-agent --release --target aarch64-unknown-linux-musl
 ./scripts/e2e-test.sh                          # full policy test suite in real microVMs
 ```
 
-Status: **M1–M4 complete** on macOS (microVMs, mounts, network policy, quotas, GUI); Linux Cloud Hypervisor backend implemented and exercised by CI on KVM runners. See ARCHITECTURE.md §11.
+The guest ships Python 3, Node.js, and git on a shared read-only rootfs, with a per-sandbox writable overlay (`pip install` and build artifacts land in the overlay, never the host or the shared image):
+
+```sh
+./target/debug/agentos run --net allowlist:pypi.org,files.pythonhosted.org \
+    -- python3 -c 'import six'      # pip-installable, network-policed
+```
+
+Status: **M1–M4 complete** on macOS (microVMs, mounts, network policy, quotas, GUI, agent runtimes + overlay); Linux Cloud Hypervisor backend implemented and exercised by CI on KVM runners. See ARCHITECTURE.md §11.

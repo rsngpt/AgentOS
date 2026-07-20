@@ -165,6 +165,16 @@ impl VmmBackend for CloudHypervisorBackend {
         for fs in &fs_args {
             cmd.arg("--fs").arg(fs);
         }
+        // Disks, in order: vda = read-only runtime rootfs, vdb = writable
+        // overlay. The guest agent unions them; keep this order in sync with
+        // its /dev/vda,/dev/vdb expectations.
+        if let Some(rootfs) = &paths.rootfs {
+            cmd.arg("--disk")
+                .arg(format!("path={},readonly=on", rootfs.display()));
+            if let Some(overlay) = &paths.overlay {
+                cmd.arg("--disk").arg(format!("path={}", overlay.display()));
+            }
+        }
         let child = cmd
             .spawn()
             .map_err(|e| Error::Backend(format!("spawn {}: {e}", self.ch_bin.display())))?;
