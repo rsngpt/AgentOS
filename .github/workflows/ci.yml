@@ -72,6 +72,8 @@ jobs:
         run: ./scripts/build-guest-image.sh
       - name: Guest overlay diagnostic
         run: sh scripts/guest-diag.sh || true
+      - name: Cloud Hypervisor stderr diagnostic
+        run: sh scripts/ch-diag.sh || true
       - name: End-to-end microVM tests
         run: ./scripts/e2e-test.sh
       - name: Daemon and sandbox logs on failure
