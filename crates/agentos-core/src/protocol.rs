@@ -43,8 +43,14 @@ pub enum HostMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum GuestMessage {
-    /// Handshake reply; sent once the guest is ready for `Exec`.
-    Hello { version: u32 },
+    /// Handshake reply. `running` is true when a command is already executing
+    /// — i.e. the daemon is *reattaching* (after a snapshot/restore) and must
+    /// stream rather than send another `Exec`.
+    Hello {
+        version: u32,
+        #[serde(default)]
+        running: bool,
+    },
     Stdout { data: Vec<u8> },
     Stderr { data: Vec<u8> },
     /// The command finished; final message on a healthy connection.

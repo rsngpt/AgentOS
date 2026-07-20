@@ -228,7 +228,7 @@ async fn drive(
         frames::read_guest_frame(&mut stream).await
     };
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, hello).await {
-        Ok(Ok(Some(GuestMessage::Hello { version }))) if version == PROTOCOL_VERSION => {}
+        Ok(Ok(Some(GuestMessage::Hello { version, .. }))) if version == PROTOCOL_VERSION => {}
         Ok(Ok(other)) => {
             return Err(Error::Protocol(format!("bad handshake reply: {other:?}")));
         }

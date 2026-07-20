@@ -120,43 +120,195 @@ mod linux {
         }
     }
 
-    /// Accept one control connection and run one session on it.
-    fn serve() -> std::io::Result<()> {
-        let listener = vsock_listen(GUEST_CONTROL_PORT)?;
-        log(&format!("listening on vsock port {GUEST_CONTROL_PORT}"));
-        let conn = vsock_accept(&listener)?;
-        log("daemon connected");
-        session(conn)
+    /// Where outgoing frames go. The sink is swapped when the daemon
+    /// (re)connects, so losing the control connection — which a
+    /// snapshot/restore necessarily does — never kills the running agent.
+    struct Outbox {
+        sink: std::sync::Mutex<Option<std::fs::File>>,
     }
 
-    fn session(conn: OwnedFd) -> std::io::Result<()> {
-        let mut reader = unsafe { std::fs::File::from_raw_fd(dup(&conn)?) };
-        let mut writer = unsafe { std::fs::File::from_raw_fd(dup(&conn)?) };
+    impl Outbox {
+        fn new() -> Self {
+            Self {
+                sink: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn attach(&self, f: Option<std::fs::File>) {
+            *self.sink.lock().unwrap() = f;
+        }
+
+        /// Write one frame. Returns false when no daemon is attached (the
+        /// frame is dropped: output produced while detached is lost).
+        fn send(&self, msg: &GuestMessage) -> bool {
+            let mut guard = self.sink.lock().unwrap();
+            match guard.as_mut() {
+                Some(w) => {
+                    if write_frame(w, msg).is_ok() {
+                        true
+                    } else {
+                        *guard = None;
+                        false
+                    }
+                }
+                None => false,
+            }
+        }
+    }
+
+    /// State that outlives any single control connection.
+    struct Session {
+        outbox: std::sync::Arc<Outbox>,
+        tx: mpsc::Sender<GuestMessage>,
+        /// Set once the command has finished, so a reattaching daemon can be
+        /// told even if the connection died before we could deliver it.
+        exited: std::sync::Arc<std::sync::Mutex<Option<ExitInfo>>>,
+        child_stdin: std::sync::Arc<std::sync::Mutex<Option<std::process::ChildStdin>>>,
+        running: bool,
+    }
+
+    /// Serve control connections until the command has finished *and* the
+    /// daemon has been told. Survives disconnects in between.
+    fn serve() -> std::io::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let outbox = std::sync::Arc::new(Outbox::new());
+        let (tx, rx) = mpsc::channel::<GuestMessage>();
+        let exit_delivered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // One router thread owns the outgoing queue for the agent's lifetime.
+        {
+            let outbox = outbox.clone();
+            let exit_delivered = exit_delivered.clone();
+            std::thread::spawn(move || {
+                for msg in rx {
+                    let is_exit = matches!(msg, GuestMessage::Exited { .. });
+                    if outbox.send(&msg) && is_exit {
+                        // The command finished *and* the daemon has been told:
+                        // flush, then halt so the daemon sees vsock EOF and
+                        // reaps the VM. If we were detached when the child
+                        // exited, this instead fires on the replay after
+                        // reattach — so a snapshot/restore can't lose the
+                        // exit status.
+                        exit_delivered.store(true, Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        power_off();
+                    }
+                }
+            });
+        }
+
+        let mut session = Session {
+            outbox: outbox.clone(),
+            tx,
+            exited: Default::default(),
+            child_stdin: Default::default(),
+            running: false,
+        };
+
+        let mut listener = vsock_listen(GUEST_CONTROL_PORT)?;
+        log(&format!("listening on vsock port {GUEST_CONTROL_PORT}"));
+
+        loop {
+            let conn = match vsock_accept(&listener) {
+                Ok(c) => c,
+                Err(e) => {
+                    // Restoring a saved VM resets the virtio-vsock device, which
+                    // can invalidate the old listener — rebuild it and carry on.
+                    log(&format!("vsock accept failed ({e}); re-listening"));
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    listener = vsock_listen(GUEST_CONTROL_PORT)?;
+                    continue;
+                }
+            };
+            log("daemon connected");
+            outbox.attach(Some(unsafe { std::fs::File::from_raw_fd(dup(&conn)?) }));
+
+            if let Err(e) = serve_connection(&conn, &mut session) {
+                log(&format!("control connection ended: {e}"));
+            }
+            outbox.attach(None);
+            // Termination is driven by the router thread (it halts once the
+            // exit status is delivered), so a lost connection just means we
+            // wait for the daemon to come back — e.g. after a restore.
+            log("daemon detached; agent still running, awaiting reattach");
+        }
+    }
+
+    /// Handshake, start the command on first attach (or replay the exit status
+    /// on a reattach), then pump host→child stdin until the connection drops.
+    fn serve_connection(conn: &OwnedFd, session: &mut Session) -> std::io::Result<()> {
+        let mut reader = unsafe { std::fs::File::from_raw_fd(dup(conn)?) };
 
         // Handshake: daemon speaks first.
         match read_frame(&mut reader)? {
             HostMessage::Hello { version } if version == PROTOCOL_VERSION => {
-                write_frame(&mut writer, &GuestMessage::Hello { version: PROTOCOL_VERSION })?;
+                session.outbox.send(&GuestMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                    running: session.running,
+                });
             }
             other => {
-                return Err(other_err(format!("expected Hello v{PROTOCOL_VERSION}, got {other:?}")));
+                return Err(other_err(format!(
+                    "expected Hello v{PROTOCOL_VERSION}, got {other:?}"
+                )));
             }
         }
 
-        // Wait for Exec.
-        let (command, env, mounts, net, cwd) = loop {
-            match read_frame(&mut reader)? {
-                HostMessage::Exec { command, env, mounts, net, cwd } => {
-                    break (command, env, mounts, net, cwd)
-                }
-                HostMessage::Hello { .. } => continue,
-                HostMessage::Stdin { .. } => continue, // no child yet
-                HostMessage::Terminate => return Ok(()),
+        if session.running {
+            // Reattach: the command is already going (or has finished while we
+            // were detached, in which case replay its exit status).
+            log("daemon reattached to a running command");
+            let exited = *session.exited.lock().unwrap();
+            if let Some(info) = exited {
+                session.tx.send(GuestMessage::Exited { info }).ok();
             }
-        };
-        if command.is_empty() {
-            return Err(other_err("empty command".into()));
+        } else {
+            let (command, env, mounts, net, cwd) = loop {
+                match read_frame(&mut reader)? {
+                    HostMessage::Exec { command, env, mounts, net, cwd } => {
+                        break (command, env, mounts, net, cwd)
+                    }
+                    HostMessage::Hello { .. } | HostMessage::Stdin { .. } => continue,
+                    HostMessage::Terminate => return Ok(()),
+                }
+            };
+            if command.is_empty() {
+                return Err(other_err("empty command".into()));
+            }
+            start_command(session, command, env, mounts, net, cwd)?;
+            session.running = true;
         }
+
+        // Host → child stdin for the life of this connection.
+        loop {
+            match read_frame(&mut reader) {
+                Ok(HostMessage::Stdin { data }) => {
+                    let mut guard = session.child_stdin.lock().unwrap();
+                    if let Some(stdin) = guard.as_mut() {
+                        if data.is_empty() || stdin.write_all(&data).is_err() {
+                            *guard = None; // EOF or broken pipe
+                        }
+                    }
+                }
+                Ok(HostMessage::Terminate) => return Ok(()),
+                Err(e) => return Err(e),
+                Ok(_) => {}
+            }
+        }
+    }
+
+    /// Prepare the guest root, start the agent command, and wire its output to
+    /// the outbox. Everything spawned here outlives the control connection.
+    fn start_command(
+        session: &Session,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        mounts: Vec<(String, String, bool)>,
+        net: agentos_core::NetPolicy,
+        cwd: Option<String>,
+    ) -> std::io::Result<()> {
+        let tx = session.tx.clone();
 
         // Set up the agent root: with a rootfs disk present, union a writable
         // overlay over the read-only runtime rootfs and chroot into it (so the
@@ -212,17 +364,9 @@ mod linux {
             .spawn()
             .map_err(|e| other_err(format!("spawn {:?}: {e}", command[0])))?;
 
-        // All frames out through one writer thread; producers: stdout pump,
-        // stderr pump, metrics ticker, and finally main sending Exited.
-        let (tx, rx) = mpsc::channel::<GuestMessage>();
-        let t_writer = std::thread::spawn(move || -> std::io::Result<std::fs::File> {
-            for msg in rx {
-                write_frame(&mut writer, &msg)?;
-            }
-            Ok(writer)
-        });
-
-        let mut child_stdin = child.stdin.take();
+        // Stdin belongs to the session, not the connection, so a reattaching
+        // daemon keeps writing to the same child.
+        *session.child_stdin.lock().unwrap() = child.stdin.take();
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
@@ -256,45 +400,31 @@ mod linux {
             });
         }
 
-        // Host → child stdin, on its own thread so we can block on frames.
+        // Reap the child on its own thread: the command's lifetime is
+        // independent of any control connection.
+        let exited = session.exited.clone();
         std::thread::spawn(move || {
-            loop {
-                match read_frame(&mut reader) {
-                    Ok(HostMessage::Stdin { data }) => {
-                        if let Some(stdin) = child_stdin.as_mut() {
-                            if data.is_empty() {
-                                child_stdin = None; // EOF
-                            } else if stdin.write_all(&data).is_err() {
-                                child_stdin = None;
-                            }
-                        }
+            t_out.join().ok();
+            t_err.join().ok();
+            let info = match child.wait() {
+                Ok(status) => {
+                    use std::os::unix::process::ExitStatusExt;
+                    ExitInfo {
+                        code: status.code(),
+                        signal: status.signal(),
                     }
-                    Ok(HostMessage::Terminate) | Err(_) => break,
-                    Ok(_) => {}
                 }
-            }
+                Err(e) => {
+                    log(&format!("waiting for child: {e}"));
+                    ExitInfo { code: None, signal: None }
+                }
+            };
+            metrics_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            *exited.lock().unwrap() = Some(info);
+            // Dropped if nobody is attached; the reattach handshake replays it.
+            tx.send(GuestMessage::Exited { info }).ok();
         });
-
-        t_out.join().ok();
-        t_err.join().ok();
-        let status = child.wait()?;
-        metrics_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-
-        #[allow(clippy::useless_conversion)]
-        let info = {
-            use std::os::unix::process::ExitStatusExt;
-            ExitInfo {
-                code: status.code(),
-                signal: status.signal(),
-            }
-        };
-        tx.send(GuestMessage::Exited { info }).ok();
-        drop(tx); // last live producer besides metrics (which checks send errors)
-        match t_writer.join() {
-            Ok(Ok(_writer)) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(other_err("writer thread panicked".into())),
-        }
+        Ok(())
     }
 
     /// Generic mount(2) wrapper. Returns false (and logs) on failure.
