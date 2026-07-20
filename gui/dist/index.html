@@ -85,6 +85,7 @@
 <header>
   <h1>Agent OS</h1>
   <span class="sub">hardware-isolated agent sandboxes</span>
+  <span class="sub">· kill switch ⇧⌘K</span>
   <span id="stats"></span>
 </header>
 <main>
@@ -252,10 +253,16 @@ listen("agentos-event", ({ payload: ev }) => {
     while (rows.children.length > 200) rows.lastChild.remove();
   } else if (k.kind === "resource_sample") {
     $("stats").textContent =
-      `${ev.sandbox.slice(0, 8)}  mem ${k.mem_mib} MiB · egress ${(k.egress_total_bytes / 1048576).toFixed(1)} MiB`;
+      `${ev.sandbox.slice(0, 8)}  cpu ${k.cpu_percent}% · mem ${k.mem_mib} MiB · egress ${(k.egress_total_bytes / 1048576).toFixed(1)} MiB`;
   } else if (k.kind === "state_changed") {
     refresh();
   }
+});
+
+// ---- global panic hotkey (⇧⌘K) fired in the Rust layer ----
+listen("panic-kill", () => {
+  termAppend("\n■ panic kill switch (⇧⌘K)\n", "err");
+  refresh();
 });
 </script>
 </body>

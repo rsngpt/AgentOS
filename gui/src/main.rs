@@ -90,6 +90,24 @@ async fn run_sandbox(
     Ok(())
 }
 
+/// Panic kill switch: terminate the most-recently-started running sandbox.
+/// Bound to a global hotkey so it works even when the window isn't focused.
+async fn kill_most_recent_running() -> Result<Value, String> {
+    let list = agentos_client::unary("sandbox.list", json!(null)).await?;
+    let running: Option<String> = list
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .rev()
+                .find(|r| r["state"]["state"] == "running")
+                .and_then(|r| r["id"].as_str().map(String::from))
+        });
+    match running {
+        Some(id) => agentos_client::unary("sandbox.kill", json!({ "id": id, "save": false })).await,
+        None => Ok(json!({ "killed": false, "reason": "no running sandbox" })),
+    }
+}
+
 /// Forward the daemon's event bus to the frontend forever, reconnecting if
 /// the daemon restarts.
 async fn pump_events(app: AppHandle) {
@@ -104,13 +122,38 @@ async fn pump_events(app: AppHandle) {
 }
 
 fn main() {
+    use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
+
+    // Global panic hotkey: Cmd/Ctrl+Shift+K terminates the newest running VM.
+    let panic_key = Shortcut::new(Some(Modifiers::SHIFT | Modifiers::SUPER), Code::KeyK);
+
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(move |app, shortcut, event| {
+                    if shortcut == &panic_key && event.state() == ShortcutState::Pressed {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let result = kill_most_recent_running().await;
+                            app.emit("panic-kill", json!({ "result": format!("{result:?}") }))
+                                .ok();
+                        });
+                    }
+                })
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![
             list_sandboxes,
             kill_sandbox,
             run_sandbox
         ])
-        .setup(|app| {
+        .setup(move |app| {
+            use tauri_plugin_global_shortcut::GlobalShortcutExt;
+            // Registration can fail (e.g. macOS accessibility not granted);
+            // the in-window Terminate buttons still work regardless.
+            if let Err(e) = app.global_shortcut().register(panic_key) {
+                eprintln!("global kill hotkey unavailable: {e}");
+            }
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(pump_events(handle));
             Ok(())

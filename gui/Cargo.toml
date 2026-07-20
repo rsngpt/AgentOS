@@ -18,4 +18,5 @@ agentos-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
+tauri-plugin-global-shortcut = "2"
 tokio.workspace = true
