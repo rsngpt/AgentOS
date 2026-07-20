@@ -26,6 +26,12 @@ use crate::registry::Registry;
 
 const MAX_HEADER: usize = 16 * 1024;
 
+/// Ceiling on simultaneous egress connections per sandbox. The guest is
+/// untrusted and can open loopback sockets in a loop; without a cap it would
+/// make the host open unbounded outbound TCP — exhausting host descriptors and
+/// turning the host into an amplifier against third parties.
+const MAX_CONNECTIONS: usize = 64;
+
 /// Serve the egress proxy for one sandbox on `socket_path` until aborted.
 pub async fn serve(
     socket_path: &Path,
@@ -36,13 +42,24 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let (conn, _) = listener.accept().await?;
+        let (mut conn, _) = listener.accept().await?;
         let policy = policy.clone();
         let bytes = bytes_total.clone();
         let registry = registry.clone();
         let sandbox = sandbox.clone();
+        // Refuse rather than queue: queueing lets the guest pin unbounded
+        // accepted sockets, which is the exhaustion we're preventing.
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            debug!("egress connection refused: {MAX_CONNECTIONS} already open");
+            tokio::spawn(async move {
+                let _ = refuse(&mut conn, "503 Service Unavailable").await;
+            });
+            continue;
+        };
         tokio::spawn(async move {
+            let _permit = permit; // released when this connection finishes
             if let Err(e) = handle_connection(conn, policy, bytes, registry, sandbox).await {
                 debug!(error = %e, "proxy connection ended");
             }
@@ -192,6 +209,13 @@ async fn refuse(guest: &mut UnixStream, status: &str) -> std::io::Result<()> {
 }
 
 fn split_host_port(authority: &str, default_port: u16) -> (String, u16) {
+    // Strip any userinfo: in `allowed.com@evil.com` the real host is what
+    // follows the LAST '@'. Parsing it off explicitly keeps the policy check
+    // looking at the host we actually connect to.
+    let authority = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => host,
+        None => authority,
+    };
     // [v6]:port | host:port | host
     if let Some(rest) = authority.strip_prefix('[') {
         if let Some((h, p)) = rest.split_once(']') {
@@ -230,22 +254,46 @@ fn is_local_destination(host: &str) -> bool {
     host.parse::<IpAddr>().is_ok_and(|ip| is_local_ip(&ip))
 }
 
-/// Loopback, private (RFC 1918), link-local, ULA, and unspecified ranges.
+/// Every address range a sandbox must never reach: loopback, RFC 1918
+/// private, link-local (incl. cloud metadata at 169.254.169.254), carrier-grade
+/// NAT, ULA, multicast/broadcast, and the reserved 0.0.0.0/8. Deliberately
+/// broad — this is the LAN-lateral-movement guarantee, so err toward blocking.
 fn is_local_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                // 0.0.0.0/8 "this network"
+                || o[0] == 0
+                // 100.64.0.0/10 carrier-grade NAT — internal space on many
+                // corporate and cloud networks.
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                // 192.0.0.0/24 IETF protocol assignments
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
         }
         IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
             v6.is_loopback()
                 || v6.is_unspecified()
+                || v6.is_multicast()
                 // ULA fc00::/7 and link-local fe80::/10
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                // v4-mapped
-                || v6.to_ipv4_mapped().is_some_and(|v4| {
-                    v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-                })
+                || (seg0 & 0xfe00) == 0xfc00
+                || (seg0 & 0xffc0) == 0xfe80
+                // v4-mapped (::ffff:a.b.c.d) and the deprecated v4-compatible
+                // (::a.b.c.d) form both re-enter the full v4 checks, so a
+                // wrapped 10.0.0.1 or 100.64.x is caught too.
+                || v6
+                    .to_ipv4_mapped()
+                    .or_else(|| match v6.segments() {
+                        [0, 0, 0, 0, 0, 0, ..] => v6.to_ipv4(),
+                        _ => None,
+                    })
+                    .is_some_and(|v4| is_local_ip(&IpAddr::V4(v4)))
         }
     }
 }
@@ -304,5 +352,55 @@ mod tests {
         assert_eq!(split_host_port("example.com:8080", 80), ("example.com".into(), 8080));
         assert_eq!(split_host_port("example.com", 80), ("example.com".into(), 80));
         assert_eq!(split_host_port("[::2]:9000", 443), ("::2".into(), 9000));
+    }
+
+    /// Userinfo must not be mistaken for the host: the destination of
+    /// `allowed.com@evil.com` is evil.com, and policy must judge *that*.
+    #[test]
+    fn userinfo_is_not_the_host() {
+        assert_eq!(
+            split_host_port("allowed.com@evil.com", 80),
+            ("evil.com".into(), 80)
+        );
+        assert_eq!(
+            split_host_port("user:pass@evil.com:8443", 443),
+            ("evil.com".into(), 8443)
+        );
+        let p = NetPolicy::Allowlist(vec!["allowed.com".into()]);
+        let (host, _) = split_host_port("allowed.com@evil.com", 80);
+        assert!(!verdict(&p, &host), "userinfo must not smuggle past the allowlist");
+    }
+
+    /// The LAN-lateral-movement guarantee: these must be unreachable in every
+    /// mode, including via IPv6 wrappers of the same v4 address.
+    #[test]
+    fn extended_local_ranges_blocked() {
+        for addr in [
+            "100.64.0.1",         // carrier-grade NAT
+            "100.127.255.255",    // CGNAT upper bound
+            "169.254.169.254",    // cloud metadata
+            "0.0.0.0",
+            "0.1.2.3",            // 0.0.0.0/8
+            "255.255.255.255",    // broadcast
+            "224.0.0.1",          // multicast
+            "192.0.0.1",          // IETF protocol assignments
+            "::ffff:10.0.0.1",    // v4-mapped private
+            "::ffff:100.64.0.1",  // v4-mapped CGNAT
+            "ff02::1",            // v6 multicast
+        ] {
+            assert!(
+                !verdict(&NetPolicy::Full, addr),
+                "{addr} must be blocked even in full mode"
+            );
+        }
+    }
+
+    /// CGNAT's neighbours are public and must still be reachable — the block
+    /// is 100.64.0.0/10, not all of 100.0.0.0/8.
+    #[test]
+    fn cgnat_block_does_not_overreach() {
+        assert!(verdict(&NetPolicy::Full, "100.63.255.255"));
+        assert!(verdict(&NetPolicy::Full, "100.128.0.1"));
+        assert!(verdict(&NetPolicy::Full, "8.8.8.8"));
     }
 }
