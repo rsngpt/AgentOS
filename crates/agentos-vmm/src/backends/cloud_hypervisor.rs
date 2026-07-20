@@ -140,44 +140,58 @@ impl VmmBackend for CloudHypervisorBackend {
             format!("size={}M,shared=on", spec.limits.mem_mib)
         };
 
+        let mut args: Vec<String> = vec![
+            "--kernel".into(),
+            paths.kernel.display().to_string(),
+            "--initramfs".into(),
+            paths.initramfs.display().to_string(),
+            "--cmdline".into(),
+            cmdline.into(),
+            "--cpus".into(),
+            format!("boot={}", spec.limits.vcpus),
+            "--memory".into(),
+            memory,
+            "--vsock".into(),
+            format!("cid=3,socket={}", vsock.display()),
+            "--serial".into(),
+            format!("file={}", dir.join("console.log").display()),
+            "--console".into(),
+            "off".into(),
+        ];
+        for fs in &fs_args {
+            args.push("--fs".into());
+            args.push(fs.clone());
+        }
+        // Disks, in order: vda = read-only runtime rootfs, vdb = writable
+        // overlay. Each value after --disk is one disk (CH parses them
+        // independently); mark read/write explicitly. Keep vda/vdb order in
+        // sync with the guest agent.
+        // `_disable_io_uring=on`: CH defaults to io_uring for block IO, which
+        // is blocked by the seccomp policy on some hosts (GitHub Actions
+        // runners) — writes then fail with I/O errors while reads still work.
+        // The synchronous path is plenty fast for our workloads.
+        if let Some(rootfs) = &paths.rootfs {
+            args.push("--disk".into());
+            args.push(format!(
+                "path={},readonly=on,_disable_io_uring=on",
+                rootfs.display()
+            ));
+            if let Some(overlay) = &paths.overlay {
+                args.push(format!(
+                    "path={},readonly=off,_disable_io_uring=on",
+                    overlay.display()
+                ));
+            }
+        }
+        tracing::info!(bin = %self.ch_bin.display(), ?args, "spawning cloud-hypervisor");
+
         let ch_log = std::fs::File::create(dir.join("helper.log"))?;
-        let mut cmd = Command::new(&self.ch_bin);
-        cmd.arg("--kernel")
-            .arg(&paths.kernel)
-            .arg("--initramfs")
-            .arg(&paths.initramfs)
-            .arg("--cmdline")
-            .arg(cmdline)
-            .arg("--cpus")
-            .arg(format!("boot={}", spec.limits.vcpus))
-            .arg("--memory")
-            .arg(&memory)
-            .arg("--vsock")
-            .arg(format!("cid=3,socket={}", vsock.display()))
-            .arg("--serial")
-            .arg(format!("file={}", dir.join("console.log").display()))
-            .arg("--console")
-            .arg("off")
+        let child = Command::new(&self.ch_bin)
+            .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::from(ch_log.try_clone()?))
             .stderr(Stdio::from(ch_log))
-            .kill_on_drop(true);
-        for fs in &fs_args {
-            cmd.arg("--fs").arg(fs);
-        }
-        // Disks, in order: vda = read-only runtime rootfs, vdb = writable
-        // overlay. Pass them as one --disk with space-separated values (CH's
-        // canonical form; repeated flags don't compose reliably) and mark
-        // read/write explicitly. Keep the vda/vdb order in sync with the
-        // guest agent.
-        if let Some(rootfs) = &paths.rootfs {
-            cmd.arg("--disk");
-            cmd.arg(format!("path={},readonly=on", rootfs.display()));
-            if let Some(overlay) = &paths.overlay {
-                cmd.arg(format!("path={},readonly=off", overlay.display()));
-            }
-        }
-        let child = cmd
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| Error::Backend(format!("spawn {}: {e}", self.ch_bin.display())))?;
 
