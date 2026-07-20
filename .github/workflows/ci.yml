@@ -70,6 +70,8 @@ jobs:
       - run: cargo build -p agentos-guest-agent --release --target x86_64-unknown-linux-musl
       - name: Build guest image
         run: ./scripts/build-guest-image.sh
+      - name: Guest overlay diagnostic
+        run: sh scripts/guest-diag.sh || true
       - name: End-to-end microVM tests
         run: ./scripts/e2e-test.sh
       - name: Daemon and sandbox logs on failure
