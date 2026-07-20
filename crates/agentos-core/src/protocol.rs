@@ -49,8 +49,14 @@ pub enum GuestMessage {
     Stderr { data: Vec<u8> },
     /// The command finished; final message on a healthy connection.
     Exited { info: ExitInfo },
-    /// Periodic guest-side resource report (advisory; host measurements win).
-    Metrics { mem_mib: u32, disk_used_mib: u32 },
+    /// Periodic guest-side resource report: memory used (MiB), overlay disk
+    /// used (MiB), and CPU% across all vCPUs since the previous report.
+    Metrics {
+        mem_mib: u32,
+        disk_used_mib: u32,
+        #[serde(default)]
+        cpu_percent: u32,
+    },
 }
 
 #[cfg(test)]

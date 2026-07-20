@@ -49,13 +49,9 @@ pub enum VmState {
     Stopped,
 }
 
-/// Host-side resource measurements for a running VM (source of truth for
-/// quotas; guest-reported numbers are advisory only).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct VmStats {
-    pub cpu_percent: u32,
-    pub rss_mib: u32,
-}
+// CPU/RAM as seen by the agent are reported by the guest (accurate on every
+// backend); the VMM process's own `ps` figures don't capture hypervisor vCPU
+// time or guest RAM on macOS, so the live monitor uses the guest's numbers.
 
 /// A bidirectional byte stream to a vsock port inside the guest.
 pub type VsockStream = Box<dyn VsockIo>;
@@ -91,8 +87,8 @@ pub trait VmmBackend: Send + Sync {
 pub trait VmHandle: Send + Sync {
     fn state(&self) -> VmState;
 
-    /// Sample host-side resource usage of the VMM process.
-    fn stats(&self) -> Result<VmStats>;
+    /// PID of the VMM process, or `None` once it has exited.
+    fn pid(&self) -> Option<u32>;
 
     /// Connect to a vsock port inside the guest (control or proxy channel).
     async fn connect_vsock(&mut self, port: u32) -> Result<VsockStream>;

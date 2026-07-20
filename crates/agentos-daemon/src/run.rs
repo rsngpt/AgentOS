@@ -254,13 +254,15 @@ async fn drive(
         .await
         .map_err(Error::Io)?;
 
-    // Auto-kill monitor: samples guest memory (advisory, updated from
-    // Metrics frames below), proxy egress bytes, and wall-clock runtime.
+    // Auto-kill monitor: samples guest CPU/memory (from Metrics frames below),
+    // proxy egress bytes, and wall-clock runtime.
     let guest_mem = Arc::new(AtomicU32::new(0));
+    let guest_cpu = Arc::new(AtomicU32::new(0));
     let monitor_task = tokio::spawn(monitor::watch(
         registry.clone(),
         id.clone(),
         spec.auto_kill,
+        guest_cpu.clone(),
         guest_mem.clone(),
         egress_bytes.clone(),
     ));
@@ -279,8 +281,9 @@ async fn drive(
                     .await
                     .map_err(Error::Io)?;
             }
-            GuestMessage::Metrics { mem_mib, .. } => {
+            GuestMessage::Metrics { mem_mib, cpu_percent, .. } => {
                 guest_mem.store(mem_mib, Ordering::Relaxed);
+                guest_cpu.store(cpu_percent, Ordering::Relaxed);
             }
             GuestMessage::Exited { info } => {
                 exit_info = Some(info);

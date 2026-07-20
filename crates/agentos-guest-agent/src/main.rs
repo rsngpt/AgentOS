@@ -236,17 +236,22 @@ mod linux {
             let tx = tx.clone();
             let stop = metrics_stop.clone();
             std::thread::spawn(move || {
+                let mut prev_cpu = read_cpu_times();
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let now_cpu = read_cpu_times();
+                    let cpu_percent = cpu_percent_between(prev_cpu, now_cpu);
+                    prev_cpu = now_cpu;
                     if tx
                         .send(GuestMessage::Metrics {
                             mem_mib: mem_used_mib(),
                             disk_used_mib: 0,
+                            cpu_percent,
                         })
                         .is_err()
                     {
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(2));
                 }
             });
         }
@@ -545,6 +550,36 @@ mod linux {
         };
         let used_kib = field("MemTotal:").saturating_sub(field("MemAvailable:"));
         (used_kib / 1024) as u32
+    }
+
+    /// (busy_jiffies, total_jiffies) from the aggregate `cpu` line of /proc/stat.
+    fn read_cpu_times() -> (u64, u64) {
+        let Ok(s) = std::fs::read_to_string("/proc/stat") else {
+            return (0, 0);
+        };
+        let Some(line) = s.lines().find(|l| l.starts_with("cpu ")) else {
+            return (0, 0);
+        };
+        let vals: Vec<u64> = line
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        let total: u64 = vals.iter().sum();
+        // idle = idle (index 3) + iowait (index 4).
+        let idle = vals.get(3).copied().unwrap_or(0) + vals.get(4).copied().unwrap_or(0);
+        (total.saturating_sub(idle), total)
+    }
+
+    /// CPU% (0..=100, across all vCPUs) from two /proc/stat samples.
+    fn cpu_percent_between(prev: (u64, u64), now: (u64, u64)) -> u32 {
+        let busy = now.0.saturating_sub(prev.0);
+        let total = now.1.saturating_sub(prev.1);
+        if total == 0 {
+            0
+        } else {
+            ((busy * 100) / total).min(100) as u32
+        }
     }
 
     /// Read a child output stream and emit protocol frames.

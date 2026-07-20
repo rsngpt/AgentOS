@@ -43,6 +43,7 @@ pub async fn watch(
     registry: Registry,
     id: SandboxId,
     rules: AutoKillRules,
+    guest_cpu_percent: Arc<AtomicU32>,
     guest_mem_mib: Arc<AtomicU32>,
     egress_bytes: Arc<AtomicU64>,
 ) {
@@ -50,13 +51,15 @@ pub async fn watch(
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let mem = guest_mem_mib.load(Ordering::Relaxed);
+        let cpu_percent = guest_cpu_percent.load(Ordering::Relaxed);
         let egress_total = egress_bytes.load(Ordering::Relaxed);
         let egress_mib = egress_total / (1024 * 1024);
         let runtime = started.elapsed().as_secs();
+
         registry.emit_event(
             id.clone(),
             EventKind::ResourceSample {
-                cpu_percent: 0, // host-side CPU sampling is future work
+                cpu_percent,
                 mem_mib: mem,
                 egress_total_bytes: egress_total,
             },

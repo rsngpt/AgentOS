@@ -144,9 +144,8 @@ impl super::super::VmHandle for VzVmHandle {
         super::super::VmState::Running
     }
 
-    fn stats(&self) -> Result<super::super::VmStats> {
-        // M2: sample the helper process's CPU/RSS via libproc.
-        Ok(super::super::VmStats::default())
+    fn pid(&self) -> Option<u32> {
+        self.child.id()
     }
 
     async fn connect_vsock(&mut self, port: u32) -> Result<super::super::VsockStream> {

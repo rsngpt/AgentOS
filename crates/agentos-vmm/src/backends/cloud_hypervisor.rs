@@ -23,7 +23,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
-use crate::{SandboxPaths, VmHandle, VmState, VmStats, VmmBackend, VsockStream};
+use crate::{SandboxPaths, VmHandle, VmState, VmmBackend, VsockStream};
 
 const CONNECT_RETRIES: u32 = 150; // x 100ms = 15s boot budget
 
@@ -210,8 +210,8 @@ impl VmHandle for ChVmHandle {
         VmState::Running
     }
 
-    fn stats(&self) -> Result<VmStats> {
-        Ok(VmStats::default())
+    fn pid(&self) -> Option<u32> {
+        self.child.id()
     }
 
     async fn connect_vsock(&mut self, port: u32) -> Result<VsockStream> {
