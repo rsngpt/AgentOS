@@ -44,8 +44,14 @@ cargo build -p agentos-guest-agent --release --target aarch64-unknown-linux-musl
 The guest ships Python 3, Node.js, and git on a shared read-only rootfs, with a per-sandbox writable overlay (`pip install` and build artifacts land in the overlay, never the host or the shared image):
 
 ```sh
-./target/debug/agentos run --net allowlist:pypi.org,files.pythonhosted.org \
-    -- python3 -c 'import six'      # pip-installable, network-policed
+# templates preset the ecosystem's network allowlist so tooling just works
+./target/debug/agentos run --template python -- pip install requests
+
+# clone a repo host-side (with your creds, no SSH keys in the guest) into /workspace
+./target/debug/agentos run --repo https://github.com/octocat/Hello-World.git \
+    --template github -- sh -c 'git log --oneline -1'
 ```
 
-Status: **M1–M4 complete** on macOS (microVMs, mounts, network policy, quotas, GUI, agent runtimes + overlay); Linux Cloud Hypervisor backend implemented and exercised by CI on KVM runners. See ARCHITECTURE.md §11.
+Live CPU/memory/egress per sandbox stream over `agentos events` and the GUI monitor; the GUI also binds a global **⇧⌘K** panic kill switch.
+
+Status: **the full PRD feature set works** on macOS + Linux — hardware-isolated microVMs, deny-by-default mounts, NIC-less network policy, quotas + auto-kill, kill switch, GUI, agent runtimes + writable overlay, git integration, templates, and live CPU/RAM/network monitoring. The Linux Cloud Hypervisor backend is exercised by CI on KVM runners; Windows is a documented stub (WSL2 path in ARCHITECTURE.md §4). See ARCHITECTURE.md §11.
