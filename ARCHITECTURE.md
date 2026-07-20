@@ -33,6 +33,7 @@ Non-goals for v1: multi-host fleet management, agent snapshotting/migration, GPU
 - Malicious content *inside* an RW-mounted directory (the agent may corrupt what you gave it write access to — that is the grant working as designed).
 - Prompt-injection making an agent misuse a *granted* permission (e.g., exfiltrating a mounted repo to an *allowlisted* domain). Agent OS constrains the channel, not the agent's judgment.
 - Side channels (Spectre-class, cache timing).
+- **A lying guest evading the `--kill-over-mem` auto-kill.** Memory and CPU in `Metrics` are *reported by the guest agent*, which a compromised agent controls, so it can under-report to avoid tripping that rule. This is acceptable because the real control is elsewhere and is not evadable: `limits.mem_mib` is a hard RAM ceiling enforced by the hypervisor at VM creation, and `limits.disk_mib` sizes the overlay — a guest simply cannot exceed either. The egress and runtime auto-kill rules are host-truth (proxy byte counters, wall clock) and likewise unevadable. Treat `--kill-over-mem` as "notice a runaway", not as a containment boundary.
 
 ## 3. Process & Component Model
 
@@ -142,7 +143,7 @@ Provisioning → Booting → Running → Exited
 ## 10. Resource Quotas & Monitoring
 
 - **Hard caps at creation** (can't be raised while running): vCPU count, RAM MiB, overlay disk MiB.
-- **Monitor loop** in the daemon samples, per sandbox: VMM process CPU/RSS (host truth), guest-reported memory/disk (advisory), and proxy byte counters (egress truth).
+- **Monitor loop** in the daemon samples, per sandbox: guest-reported CPU% and memory (from `/proc/stat` and `/proc/meminfo` in the guest — the VMM process's host-side figures don't capture hypervisor vCPU time or guest RAM on macOS) and proxy byte counters (host truth). Guest-reported numbers are advisory: see the threat-model note in §2 on what that means for `--kill-over-mem`.
 - **Auto-kill rules** evaluated on each sample: `mem > limit`, `egress_bytes > limit`, optional wall-clock timeout. Trigger ⇒ same path as the manual kill switch, with the triggering rule recorded in the sandbox's event log.
 
 ## 11. Milestone Roadmap

