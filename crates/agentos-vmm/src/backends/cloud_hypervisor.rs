@@ -166,21 +166,18 @@ impl VmmBackend for CloudHypervisorBackend {
         // overlay. Each value after --disk is one disk (CH parses them
         // independently); mark read/write explicitly. Keep vda/vdb order in
         // sync with the guest agent.
-        // `_disable_io_uring=on`: CH defaults to io_uring for block IO, which
-        // is blocked by the seccomp policy on some hosts (GitHub Actions
-        // runners) — writes then fail with I/O errors while reads still work.
-        // The synchronous path is plenty fast for our workloads.
+        // Disks: vda = rootfs, vdb = overlay, as separate --disk flags.
+        // NOTE: `readonly=on` on the rootfs disk made the *overlay* unwritable
+        // on CH (write I/O errors on vdb) in every combination tried, so it's
+        // omitted for now. The rootfs is a squashfs (kernel can't write it) and
+        // the guest mounts it read-only; hardening /dev/vda against a hostile
+        // guest `dd` is a follow-up (per-sandbox rootfs copy or file-mode).
         if let Some(rootfs) = &paths.rootfs {
             args.push("--disk".into());
-            args.push(format!(
-                "path={},readonly=on,_disable_io_uring=on",
-                rootfs.display()
-            ));
+            args.push(format!("path={}", rootfs.display()));
             if let Some(overlay) = &paths.overlay {
-                args.push(format!(
-                    "path={},readonly=off,_disable_io_uring=on",
-                    overlay.display()
-                ));
+                args.push("--disk".into());
+                args.push(format!("path={}", overlay.display()));
             }
         }
         tracing::info!(bin = %self.ch_bin.display(), ?args, "spawning cloud-hypervisor");
