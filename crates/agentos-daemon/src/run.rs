@@ -66,6 +66,34 @@ fn agentos_home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").expect("HOME not set")).join(".agentos")
 }
 
+/// Clone `repo` into `dest` on the host. Runs the host's `git`, so it uses
+/// whatever credentials the host already has — none of which is exposed to
+/// the guest, which only ever sees the checked-out files. Shallow by default.
+async fn clone_repo(repo: &agentos_core::RepoSpec, dest: &std::path::Path) -> Result<()> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("clone").arg("--depth").arg("1");
+    if let Some(r) = &repo.git_ref {
+        cmd.arg("--branch").arg(r);
+    }
+    // `--` guards against a URL that looks like an option.
+    cmd.arg("--").arg(&repo.url).arg(dest);
+    cmd.stdin(std::process::Stdio::null());
+
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| Error::Backend(format!("running git: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(Error::InvalidSpec(format!(
+            "git clone {} failed: {}",
+            repo.url,
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
 async fn drive(
     registry: &Registry,
     id: &agentos_core::SandboxId,
@@ -100,6 +128,21 @@ async fn drive(
 
     let sandbox_dir = home.join("sandboxes").join(id.to_string());
     std::fs::create_dir_all(&sandbox_dir)?;
+
+    // Git repo: clone host-side (with the host's git + credentials), then mount
+    // the working tree RW at /workspace. Keys/tokens never enter the guest.
+    if let Some(repo) = spec.repo.clone() {
+        emit(client, json!({ "event": "cloning", "url": repo.url }))
+            .await
+            .map_err(Error::Io)?;
+        let dest = sandbox_dir.join("workspace");
+        clone_repo(&repo, &dest).await?;
+        spec.mounts.push(agentos_core::MountSpec {
+            host_path: dest,
+            guest_path: agentos_core::REPO_GUEST_PATH.into(),
+            mode: agentos_core::MountMode::ReadWrite,
+        });
+    }
 
     // Runtime rootfs (shared, read-only) + a fresh per-sandbox writable overlay
     // disk sized to the disk quota. Optional: without the rootfs image the guest
@@ -190,6 +233,11 @@ async fn drive(
             )
         })
         .collect();
+    // Run in the cloned repo when one was provided.
+    let cwd = spec
+        .repo
+        .as_ref()
+        .map(|_| agentos_core::REPO_GUEST_PATH.to_string());
     frames::write_host_frame(
         &mut stream,
         &HostMessage::Exec {
@@ -197,6 +245,7 @@ async fn drive(
             env: spec.env.clone(),
             mounts: exec_mounts,
             net: spec.net.clone(),
+            cwd,
         },
     )
     .await?;

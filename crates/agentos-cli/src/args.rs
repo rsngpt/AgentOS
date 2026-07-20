@@ -45,6 +45,15 @@ pub struct RunArgs {
     #[arg(long = "mount", value_name = "PATH[:ro|rw]")]
     pub mounts: Vec<String>,
 
+    /// Clone a git repo host-side (with your credentials) and mount it at
+    /// /workspace — SSH keys and tokens never enter the guest.
+    #[arg(long = "repo", value_name = "URL")]
+    pub repo: Option<String>,
+
+    /// Branch/tag/commit to check out with --repo (default branch otherwise).
+    #[arg(long = "branch", value_name = "REF", requires = "repo")]
+    pub branch: Option<String>,
+
     /// Network policy: offline (default), full, or allowlist:host1,host2.
     /// Localhost and LAN destinations are always blocked.
     #[arg(long = "net", default_value = "offline", value_name = "POLICY")]
@@ -108,11 +117,17 @@ impl RunArgs {
             .name
             .unwrap_or_else(|| self.command[0].rsplit('/').next().unwrap_or("agent").to_string());
 
+        let repo = self.repo.map(|url| agentos_core::RepoSpec {
+            url,
+            git_ref: self.branch,
+        });
+
         Ok(SandboxSpec {
             name,
             command: self.command,
             env,
             mounts,
+            repo,
             net,
             limits: ResourceLimits {
                 vcpus: self.vcpus,
@@ -184,6 +199,24 @@ mod tests {
         let spec = parse_run(&["agentos", "run", "--", "echo", "hi"]).into_spec().unwrap();
         assert!(spec.mounts.is_empty());
         assert_eq!(spec.net, NetPolicy::Offline);
+        assert!(spec.repo.is_none());
+    }
+
+    #[test]
+    fn repo_with_branch() {
+        let spec = parse_run(&[
+            "agentos", "run", "--repo", "https://x/y.git", "--branch", "dev", "--", "make",
+        ])
+        .into_spec()
+        .unwrap();
+        let repo = spec.repo.unwrap();
+        assert_eq!(repo.url, "https://x/y.git");
+        assert_eq!(repo.git_ref.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn branch_requires_repo() {
+        assert!(Cli::try_parse_from(["agentos", "run", "--branch", "dev", "--", "make"]).is_err());
     }
 
     #[test]

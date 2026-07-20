@@ -171,6 +171,24 @@ pub enum TerminationDisposition {
     Save,
 }
 
+/// A git repository to clone into the sandbox.
+///
+/// The clone happens **host-side** in the daemon (using the host's git and
+/// whatever credentials it already has), then the working tree is mounted
+/// read-write into the guest. The guest never sees `~/.ssh`, credential
+/// helpers, or tokens — only the checked-out files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoSpec {
+    /// Clone URL (https or ssh; resolved with host credentials).
+    pub url: String,
+    /// Branch/tag/commit to check out (default branch when `None`).
+    #[serde(default)]
+    pub git_ref: Option<String>,
+}
+
+/// Guest path the cloned repo is mounted at (and the command's working dir).
+pub const REPO_GUEST_PATH: &str = "/workspace";
+
 /// The complete, user-approved grant for one sandbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxSpec {
@@ -183,6 +201,9 @@ pub struct SandboxSpec {
     pub env: Vec<(String, String)>,
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
+    /// Repo to clone host-side and mount at [`REPO_GUEST_PATH`].
+    #[serde(default)]
+    pub repo: Option<RepoSpec>,
     #[serde(default)]
     pub net: NetPolicy,
     #[serde(default)]
@@ -233,6 +254,10 @@ mod tests {
             command: vec!["python3".into(), "agent.py".into()],
             env: vec![("OPENAI_API_KEY".into(), "sk-test".into())],
             mounts: vec![MountSpec::parse("./proj:rw").unwrap()],
+            repo: Some(RepoSpec {
+                url: "https://github.com/example/agent.git".into(),
+                git_ref: Some("main".into()),
+            }),
             net: NetPolicy::Allowlist(vec!["api.openai.com".into()]),
             limits: ResourceLimits::default(),
             auto_kill: AutoKillRules {

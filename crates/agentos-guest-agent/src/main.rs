@@ -144,10 +144,10 @@ mod linux {
         }
 
         // Wait for Exec.
-        let (command, env, mounts, net) = loop {
+        let (command, env, mounts, net, cwd) = loop {
             match read_frame(&mut reader)? {
-                HostMessage::Exec { command, env, mounts, net } => {
-                    break (command, env, mounts, net)
+                HostMessage::Exec { command, env, mounts, net, cwd } => {
+                    break (command, env, mounts, net, cwd)
                 }
                 HostMessage::Hello { .. } => continue,
                 HostMessage::Stdin { .. } => continue, // no child yet
@@ -192,15 +192,21 @@ mod linux {
             // and the loopback proxy (init's network namespace) survive it;
             // PATH is then searched inside the new root, so `python3` resolves.
             let newroot = newroot.to_string();
+            // chdir into cwd (e.g. /workspace) relative to the new root, else /.
+            let chdir_to = cwd.clone().unwrap_or_else(|| "/".into());
             unsafe {
                 cmd.pre_exec(move || {
-                    let c = std::ffi::CString::new(newroot.as_str()).unwrap();
-                    if libc::chroot(c.as_ptr()) != 0 || libc::chdir(c"/".as_ptr()) != 0 {
+                    let root_c = std::ffi::CString::new(newroot.as_str()).unwrap();
+                    let dir_c = std::ffi::CString::new(chdir_to.as_str()).unwrap();
+                    if libc::chroot(root_c.as_ptr()) != 0 || libc::chdir(dir_c.as_ptr()) != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                     Ok(())
                 });
             }
+        } else if let Some(dir) = &cwd {
+            // No chroot (initramfs fallback): best-effort working directory.
+            cmd.current_dir(dir);
         }
         let mut child = cmd
             .spawn()

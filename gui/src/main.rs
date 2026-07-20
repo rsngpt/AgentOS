@@ -52,6 +52,7 @@ async fn run_sandbox(
         command: argv,
         env: vec![],
         mounts,
+        repo: None,
         net,
         limits: ResourceLimits {
             vcpus,

@@ -14,8 +14,8 @@ pub mod state;
 
 pub use error::{Error, Result};
 pub use spec::{
-    AutoKillRules, MountMode, MountSpec, NetPolicy, ResourceLimits, SandboxId, SandboxSpec,
-    TerminationDisposition,
+    AutoKillRules, MountMode, MountSpec, NetPolicy, RepoSpec, ResourceLimits, SandboxId,
+    SandboxSpec, TerminationDisposition, REPO_GUEST_PATH,
 };
 pub use state::{ExitInfo, SandboxState};
 

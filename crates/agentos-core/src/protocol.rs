@@ -27,6 +27,10 @@ pub enum HostMessage {
         mounts: Vec<(String, String, bool)>,
         /// Determines whether the guest configures proxy env vars at all.
         net: NetPolicy,
+        /// Working directory for the command (inside the guest root). `None`
+        /// runs at `/`.
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// Stdin bytes for the running command.
     Stdin { data: Vec<u8> },
@@ -64,6 +68,7 @@ mod tests {
                 env: vec![],
                 mounts: vec![("share0".into(), "/mnt/project".into(), true)],
                 net: NetPolicy::Offline,
+                cwd: Some("/workspace".into()),
             },
         ];
         for m in msgs {

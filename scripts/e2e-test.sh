@@ -59,6 +59,11 @@ echo "== overlay: the agent root is writable (copy-up over the ro rootfs) =="
 out=$("$AGENTOS" run -- sh -c 'echo ok > /usr/agentos-write-test && cat /usr/agentos-write-test' 2>/dev/null)
 check "overlay makes the root writable" "ok" "$out"
 
+echo "== git: --repo clones host-side and mounts at /workspace =="
+out=$("$AGENTOS" run --repo https://github.com/octocat/Hello-World.git -- sh -c 'pwd; test -f README && echo readme-present' 2>/dev/null)
+check "repo cloned and mounted at /workspace" "/workspace
+readme-present" "$out"
+
 echo "== network: offline (default) =="
 out=$("$AGENTOS" run -- sh -c 'wget -T 5 -q -O- http://example.com >/dev/null 2>&1 && echo LEAK || echo blocked' 2>/dev/null)
 check "offline blocks egress" "blocked" "$out"
