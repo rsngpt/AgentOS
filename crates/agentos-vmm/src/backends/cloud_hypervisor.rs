@@ -265,6 +265,32 @@ impl VmHandle for ChVmHandle {
         self.ch_remote("resume").await
     }
 
+    async fn snapshot(&mut self, path: &std::path::Path) -> Result<()> {
+        // CH requires the VM be paused before snapshotting, and writes a
+        // *directory* of state files addressed by URL.
+        self.ch_remote("pause").await?;
+        std::fs::create_dir_all(path)?;
+        let out = Command::new(&self.ch_remote)
+            .arg("--api-socket")
+            .arg(&self.api_socket)
+            .arg("snapshot")
+            .arg(format!("file://{}", path.display()))
+            .output()
+            .await
+            .map_err(|e| Error::Backend(format!("running ch-remote snapshot: {e}")))?;
+        if !out.status.success() {
+            return Err(Error::Backend(format!(
+                "ch-remote snapshot failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        self.child.kill().await.ok();
+        for fsd in &mut self.virtiofsds {
+            fsd.kill().await.ok();
+        }
+        Ok(())
+    }
+
     async fn kill(&mut self) -> Result<()> {
         for fsd in &mut self.virtiofsds {
             fsd.kill().await.ok();

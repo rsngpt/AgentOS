@@ -150,6 +150,42 @@ impl Registry {
         Ok(())
     }
 
+    /// Write the VM's state to `path` and tear the VM down. The sandbox dir
+    /// survives so `restore` can bring it back mid-execution.
+    pub async fn snapshot(&self, id: &SandboxId, path: &std::path::Path) -> Result<()> {
+        let handle = {
+            let guard = self.inner.lock().await;
+            let sb = guard
+                .get(id)
+                .ok_or_else(|| Error::UnknownSandbox(id.clone()))?;
+            if !matches!(sb.state, SandboxState::Running | SandboxState::Paused) {
+                return Err(Error::InvalidState {
+                    id: id.clone(),
+                    state: format!("{:?}", sb.state),
+                    reason: "only a running or paused sandbox can be snapshotted".into(),
+                });
+            }
+            sb.handle.clone()
+        };
+        let handle = handle.ok_or_else(|| Error::InvalidState {
+            id: id.clone(),
+            state: "no vm".into(),
+            reason: "sandbox has no running VM".into(),
+        })?;
+        // Mark it first so the run task, which sees the VM disappear, knows
+        // this was a snapshot and keeps the sandbox dir.
+        self.set_state(id, SandboxState::Snapshotted).await;
+        // If this fails the VM may be gone anyway, so surface the error rather
+        // than pretending the sandbox is still healthy.
+        let mut vm = handle.lock().await;
+        vm.snapshot(path).await
+    }
+
+    /// Spec of a sandbox, for restoring it later.
+    pub async fn spec(&self, id: &SandboxId) -> Option<SandboxSpec> {
+        self.inner.lock().await.get(id).map(|sb| sb.spec.clone())
+    }
+
     /// The kill switch: SIGKILL the VMM child. Absolute and immediate.
     pub async fn kill(
         &self,

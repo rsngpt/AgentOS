@@ -52,6 +52,20 @@ pub async fn serve_connection(
             return Ok(()); // connection was dedicated to this run
         }
 
+        if req.method == "sandbox.restore" {
+            #[derive(Deserialize)]
+            struct IdParam {
+                id: SandboxId,
+            }
+            match serde_json::from_value::<IdParam>(req.params) {
+                Ok(p) => run::restore_sandbox(registry.clone(), p.id, &mut write).await?,
+                Err(e) => {
+                    respond(&mut write, req.id, Err(format!("invalid params: {e}"))).await?;
+                }
+            }
+            return Ok(()); // connection was dedicated to this restore
+        }
+
         if req.method == "events.subscribe" {
             // Dedicated connection: stream every registry event as a JSON
             // line until the client goes away (write failure ends us).
@@ -87,6 +101,20 @@ async fn unary(req: &Request, registry: &Registry) -> Result<Value, String> {
             .into_iter()
             .map(|(id, name, state)| json!({ "id": id, "name": name, "state": state }))
             .collect::<Vec<_>>())),
+        "sandbox.snapshot" => {
+            #[derive(Deserialize)]
+            struct IdParam {
+                id: SandboxId,
+            }
+            let p: IdParam = serde_json::from_value(req.params.clone())
+                .map_err(|e| format!("invalid params: {e}"))?;
+            let dir = crate::run::sandbox_dir(&p.id);
+            registry
+                .snapshot(&p.id, &crate::run::state_path(&dir))
+                .await
+                .map(|_| json!({ "snapshotted": true, "dir": dir.display().to_string() }))
+                .map_err(|e| e.to_string())
+        }
         "sandbox.pause" | "sandbox.resume" => {
             #[derive(Deserialize)]
             struct IdParam {

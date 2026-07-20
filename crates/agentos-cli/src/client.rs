@@ -10,12 +10,18 @@ pub use agentos_client::unary;
 /// Run a sandbox, streaming its output to our stdio.
 /// Returns the process exit code to use.
 pub async fn run(spec: SandboxSpec) -> Result<i32, String> {
-    let mut stream = agentos_client::open_stream(
+    let stream = agentos_client::open_stream(
         "sandbox.run",
         serde_json::to_value(&spec).map_err(|e| e.to_string())?,
     )
     .await?;
+    stream_run_events(stream).await
+}
 
+/// Render a run/restore event stream to our stdio, returning the exit code.
+async fn stream_run_events(
+    mut stream: agentos_client::EventStream,
+) -> Result<i32, String> {
     let mut stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
     while let Some(v) = stream.next().await? {
@@ -25,6 +31,13 @@ pub async fn run(spec: SandboxSpec) -> Result<i32, String> {
         match v["event"].as_str() {
             Some("created") => {
                 eprintln!("sandbox {} created", v["id"].as_str().unwrap_or("?"));
+            }
+            Some("restoring") => {
+                eprintln!("restoring sandbox {}", v["id"].as_str().unwrap_or("?"));
+            }
+            Some("snapshotted") => {
+                eprintln!("sandbox snapshotted; state in {}", v["dir"].as_str().unwrap_or("?"));
+                return Ok(0);
             }
             Some("running") => {}
             Some("stdout") => {
@@ -59,6 +72,12 @@ fn bytes(v: &Value) -> Vec<u8> {
     v.as_array()
         .map(|a| a.iter().filter_map(|b| b.as_u64().map(|b| b as u8)).collect())
         .unwrap_or_default()
+}
+
+/// Restore a snapshotted sandbox and stream its output like `run` does.
+pub async fn restore(id: &str) -> Result<i32, String> {
+    let stream = agentos_client::open_stream("sandbox.restore", json!({ "id": id })).await?;
+    stream_run_events(stream).await
 }
 
 /// Stream daemon events to stdout as JSON lines until interrupted.

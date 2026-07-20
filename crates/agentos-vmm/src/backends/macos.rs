@@ -67,6 +67,35 @@ impl super::super::VmmBackend for VzBackend {
         spec: &SandboxSpec,
         paths: &super::super::SandboxPaths,
     ) -> Result<Box<dyn super::super::VmHandle>> {
+        self.spawn_helper(spec, paths, None)
+    }
+
+    async fn restore(
+        &self,
+        spec: &SandboxSpec,
+        paths: &super::super::SandboxPaths,
+        state_path: &std::path::Path,
+    ) -> Result<Box<dyn super::super::VmHandle>> {
+        if !state_path.exists() {
+            return Err(Error::Backend(format!(
+                "no saved VM state at {}",
+                state_path.display()
+            )));
+        }
+        self.spawn_helper(spec, paths, Some(state_path))
+    }
+}
+
+impl VzBackend {
+    /// Spawn the helper for this sandbox. With `restore_from` set it revives a
+    /// snapshot instead of booting fresh; the configuration is otherwise
+    /// identical, which Virtualization.framework requires for a restore.
+    fn spawn_helper(
+        &self,
+        spec: &SandboxSpec,
+        paths: &super::super::SandboxPaths,
+        restore_from: Option<&std::path::Path>,
+    ) -> Result<Box<dyn super::super::VmHandle>> {
         if !self.helper.exists() {
             return Err(Error::Backend(format!(
                 "vmhelper not found at {} (build it with scripts/build-vmhelper.sh)",
@@ -108,6 +137,8 @@ impl super::super::VmmBackend for VzBackend {
             "disks": disks,
             "proxy_socket": paths.proxy_socket,
             "proxy_port": paths.proxy_socket.as_ref().map(|_| agentos_core::HOST_PROXY_PORT),
+            "save_path": paths.sandbox_dir.join("vmstate"),
+            "restore_path": restore_from,
         });
         let config_path = paths.sandbox_dir.join("vmconfig.json");
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
@@ -182,6 +213,19 @@ impl super::super::VmHandle for VzVmHandle {
 
     async fn resume(&mut self) -> Result<()> {
         self.signal_helper(libc::SIGUSR2, "resume")
+    }
+
+    async fn snapshot(&mut self, _path: &std::path::Path) -> Result<()> {
+        // The helper writes to the save_path baked into its config (the same
+        // sandbox dir), pauses first as the API requires, then exits.
+        self.signal_helper(libc::SIGHUP, "snapshot")?;
+        let status = self.child.wait().await?;
+        if !status.success() {
+            return Err(Error::Backend(format!(
+                "vmhelper exited {status} while saving state (see helper.log)"
+            )));
+        }
+        Ok(())
     }
 
     async fn kill(&mut self) -> Result<()> {

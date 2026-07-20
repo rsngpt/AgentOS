@@ -43,6 +43,17 @@ pub enum Command {
         /// Sandbox id (from `agentos ps`).
         id: String,
     },
+    /// Save a sandbox's VM state to disk and tear the VM down. Restore it
+    /// later with `agentos restore` — the command picks up mid-task.
+    Snapshot {
+        /// Sandbox id (from `agentos ps`).
+        id: String,
+    },
+    /// Bring a snapshotted sandbox back and stream its output.
+    Restore {
+        /// Sandbox id (from `agentos ps`).
+        id: String,
+    },
     /// Stream daemon events (state changes, network verdicts, resource samples).
     Events,
 }

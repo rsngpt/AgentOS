@@ -34,6 +34,42 @@ async fn emit(
     w.flush().await
 }
 
+/// Per-sandbox directory: overlay, logs, saved VM state, cloned workspace.
+pub fn sandbox_dir(id: &agentos_core::SandboxId) -> PathBuf {
+    agentos_home().join("sandboxes").join(id.to_string())
+}
+
+/// Path holding a sandbox's saved VM state (a file on vz, a directory on CH).
+pub fn state_path(sandbox_dir: &std::path::Path) -> PathBuf {
+    sandbox_dir.join("vmstate")
+}
+
+/// Bring a snapshotted sandbox back and stream it to `client`, picking the
+/// command up mid-execution.
+pub async fn restore_sandbox(
+    registry: Registry,
+    id: agentos_core::SandboxId,
+    client: &mut (impl AsyncWrite + Unpin),
+) -> std::io::Result<()> {
+    let Some(spec) = registry.spec(&id).await else {
+        return emit(
+            client,
+            json!({ "event": "error", "message": format!("unknown sandbox {id}") }),
+        )
+        .await;
+    };
+    let sandbox_dir = agentos_home().join("sandboxes").join(id.to_string());
+    emit(client, json!({ "event": "restoring", "id": id })).await?;
+
+    match drive(&registry, &id, spec, client, Some(state_path(&sandbox_dir))).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::warn!(%id, error = %e, "restore failed");
+            emit(client, json!({ "event": "error", "message": e.to_string() })).await
+        }
+    }
+}
+
 /// Run one sandbox to completion, streaming events to `client`.
 pub async fn run_sandbox(
     registry: Registry,
@@ -43,7 +79,7 @@ pub async fn run_sandbox(
     let id = registry.create(spec.clone()).await;
     emit(client, json!({ "event": "created", "id": id })).await?;
 
-    match drive(&registry, &id, spec, client).await {
+    match drive(&registry, &id, spec, client, None).await {
         Ok(()) => Ok(()),
         Err(e) => {
             tracing::warn!(%id, error = %e, "sandbox run failed");
@@ -121,7 +157,9 @@ async fn drive(
     id: &agentos_core::SandboxId,
     mut spec: SandboxSpec,
     client: &mut (impl AsyncWrite + Unpin),
+    restore_from: Option<PathBuf>,
 ) -> Result<()> {
+    let restoring = restore_from.is_some();
     // Provision: images present, mount sources valid.
     let home = agentos_home();
     let images = home.join("images");
@@ -153,12 +191,16 @@ async fn drive(
 
     // Git repo: clone host-side (with the host's git + credentials), then mount
     // the working tree RW at /workspace. Keys/tokens never enter the guest.
+    // On restore the clone is already there — just re-attach the same mount,
+    // since the restored guest expects an identical device set.
     if let Some(repo) = spec.repo.clone() {
-        emit(client, json!({ "event": "cloning", "url": repo.url }))
-            .await
-            .map_err(Error::Io)?;
         let dest = sandbox_dir.join("workspace");
-        clone_repo(&repo, &dest).await?;
+        if !restoring {
+            emit(client, json!({ "event": "cloning", "url": repo.url }))
+                .await
+                .map_err(Error::Io)?;
+            clone_repo(&repo, &dest).await?;
+        }
         spec.mounts.push(agentos_core::MountSpec {
             host_path: dest,
             guest_path: agentos_core::REPO_GUEST_PATH.into(),
@@ -172,9 +214,13 @@ async fn drive(
     let rootfs = images.join("rootfs.squashfs");
     let (rootfs, overlay) = if rootfs.exists() {
         let overlay = sandbox_dir.join("overlay.img");
-        let f = std::fs::File::create(&overlay)?;
-        // Sparse: allocates lazily, capped at the quota.
-        f.set_len(u64::from(spec.limits.disk_mib) * 1024 * 1024)?;
+        if !restoring {
+            let f = std::fs::File::create(&overlay)?;
+            // Sparse: allocates lazily, capped at the quota.
+            f.set_len(u64::from(spec.limits.disk_mib) * 1024 * 1024)?;
+        }
+        // Restoring reuses the existing overlay untouched — the saved guest
+        // RAM refers to its exact contents.
         (Some(rootfs), Some(overlay))
     } else {
         (None, None)
@@ -212,9 +258,17 @@ async fn drive(
         proxy_socket,
     };
 
-    // Boot.
-    info!(%id, backend = backend.name(), "booting microVM");
-    let mut handle = backend.create(&spec, &paths).await?;
+    // Boot, or bring a snapshot back.
+    let mut handle = match &restore_from {
+        Some(state) => {
+            info!(%id, backend = backend.name(), state = %state.display(), "restoring microVM");
+            backend.restore(&spec, &paths, state).await?
+        }
+        None => {
+            info!(%id, backend = backend.name(), "booting microVM");
+            backend.create(&spec, &paths).await?
+        }
+    };
     registry.set_state(id, SandboxState::Booting).await;
 
     let mut stream = handle.connect_vsock(GUEST_CONTROL_PORT).await?;
@@ -227,8 +281,14 @@ async fn drive(
             .await?;
         frames::read_guest_frame(&mut stream).await
     };
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, hello).await {
-        Ok(Ok(Some(GuestMessage::Hello { version, .. }))) if version == PROTOCOL_VERSION => {}
+    // `running` means the guest already has a command going — we're
+    // reattaching to a restored VM and must not issue a second Exec.
+    let already_running = match tokio::time::timeout(HANDSHAKE_TIMEOUT, hello).await {
+        Ok(Ok(Some(GuestMessage::Hello { version, running })))
+            if version == PROTOCOL_VERSION =>
+        {
+            running
+        }
         Ok(Ok(other)) => {
             return Err(Error::Protocol(format!("bad handshake reply: {other:?}")));
         }
@@ -240,7 +300,7 @@ async fn drive(
                 sandbox_dir.display()
             )));
         }
-    }
+    };
 
     // Exec.
     let exec_mounts = spec
@@ -260,17 +320,21 @@ async fn drive(
         .repo
         .as_ref()
         .map(|_| agentos_core::REPO_GUEST_PATH.to_string());
-    frames::write_host_frame(
-        &mut stream,
-        &HostMessage::Exec {
-            command: spec.command.clone(),
-            env: spec.env.clone(),
-            mounts: exec_mounts,
-            net: spec.net.clone(),
-            cwd,
-        },
-    )
-    .await?;
+    if already_running {
+        info!(%id, "reattached to a command already running in the guest");
+    } else {
+        frames::write_host_frame(
+            &mut stream,
+            &HostMessage::Exec {
+                command: spec.command.clone(),
+                env: spec.env.clone(),
+                mounts: exec_mounts,
+                net: spec.net.clone(),
+                cwd,
+            },
+        )
+        .await?;
+    }
     registry.set_state(id, SandboxState::Running).await;
     emit(client, json!({ "event": "running" }))
         .await
@@ -331,6 +395,18 @@ async fn drive(
             emit(
                 client,
                 json!({ "event": "exited", "code": info.code, "signal": info.signal }),
+            )
+            .await
+            .map_err(Error::Io)?;
+        }
+        // A snapshot also ends the stream (the VM is gone, its state is on
+        // disk). Keep the sandbox dir — it holds the state file and overlay
+        // that `agentos restore` needs.
+        None if matches!(registry.get_state(id).await, Some(SandboxState::Snapshotted)) => {
+            info!(%id, dir = %sandbox_dir.display(), "sandbox snapshotted");
+            emit(
+                client,
+                json!({ "event": "snapshotted", "dir": sandbox_dir.display().to_string() }),
             )
             .await
             .map_err(Error::Io)?;

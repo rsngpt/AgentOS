@@ -45,6 +45,10 @@ struct HelperConfig: Codable {
     /// this Unix socket (the daemon's per-sandbox egress proxy).
     var proxy_socket: String?
     var proxy_port: UInt32?
+    /// Where SIGHUP writes the saved VM state (snapshot).
+    var save_path: String?
+    /// When set, boot by restoring this saved state instead of starting fresh.
+    var restore_path: String?
 }
 
 func fail(_ msg: String) -> Never {
@@ -237,6 +241,9 @@ final class ProxyBridge: NSObject, VZVirtioSocketListenerDelegate {
 
 var proxyBridge: ProxyBridge? // must outlive the VM
 var proxyListener: VZVirtioSocketListener?
+/// The daemon's control connection, so a snapshot can close it first: a live
+/// virtio-socket connection cannot be captured in saved VM state.
+var controlConnection: VZVirtioSocketConnection?
 
 func installProxyListener() {
     guard let udsPath = config.proxy_socket, let port = config.proxy_port else { return }
@@ -258,8 +265,10 @@ func connectVsock(attempt: Int) {
         switch result {
         case .success(let conn):
             note("vsock connected (attempt \(attempt))")
-            // Keep the connection object alive for the process lifetime.
+            // Keep the connection object alive for the process lifetime, and
+            // reachable so a snapshot can tear it down before saving.
             objc_setAssociatedObject(vm, "agentos.conn", conn, .OBJC_ASSOCIATION_RETAIN)
+            controlConnection = conn
             startRelay(connFd: conn.fileDescriptor)
         case .failure:
             if attempt >= 100 {
@@ -276,8 +285,11 @@ func connectVsock(attempt: Int) {
 // our stdio is already dedicated to relaying the guest's vsock stream.
 // SIGUSR1 = pause, SIGUSR2 = resume. Dispatch sources run the handler on the
 // VM queue, which is where Virtualization.framework requires these calls.
+// Default dispositions must be disabled or the process dies before the
+// dispatch sources below ever see the signal.
 signal(SIGUSR1, SIG_IGN)
 signal(SIGUSR2, SIG_IGN)
+signal(SIGHUP, SIG_IGN)
 let pauseSource = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: queue)
 pauseSource.setEventHandler {
     guard vm.canPause else {
@@ -308,15 +320,93 @@ resumeSource.setEventHandler {
 }
 resumeSource.resume()
 
+// SIGHUP = snapshot: pause (save requires it), write the state file, exit.
+// The process dying destroys the VM, which is fine — its state is on disk.
+let saveSource = DispatchSource.makeSignalSource(signal: SIGHUP, queue: queue)
+saveSource.setEventHandler {
+    guard let savePath = config.save_path else {
+        note("snapshot requested but no save_path configured")
+        return
+    }
+    #if arch(arm64)
+    guard #available(macOS 14.0, *) else {
+        note("snapshot requires macOS 14+")
+        return
+    }
+    func writeState() {
+        // Live virtio-socket state can't be captured in a saved VM: tear the
+        // control connection and proxy listener down first. The guest agent
+        // re-listens after the restore.
+        controlConnection?.close()
+        controlConnection = nil
+        if let listener = proxyListener,
+           let dev = vm.socketDevices.first as? VZVirtioSocketDevice,
+           let port = config.proxy_port {
+            dev.removeSocketListener(forPort: port)
+            _ = listener
+            proxyListener = nil
+        }
+        vm.saveMachineStateTo(url: URL(fileURLWithPath: savePath)) { error in
+            if let error {
+                fail("saving VM state: \(error)")
+            }
+            note("state saved to \(savePath)")
+            exit(0)
+        }
+    }
+    if vm.canPause {
+        vm.pause { result in
+            switch result {
+            case .success: writeState()
+            case .failure(let e): fail("pause before save: \(e)")
+            }
+        }
+    } else {
+        writeState() // already paused
+    }
+    #else
+    note("snapshot is arm64-only")
+    #endif
+}
+saveSource.resume()
+
+/// Everything that must happen once the guest is executing, whether it was
+/// booted fresh or restored from a snapshot.
+@Sendable func guestIsRunning(_ how: String) {
+    note("VM running (\(how))")
+    installProxyListener()
+    connectVsock(attempt: 1)
+}
+
 queue.async {
-    vm.start { result in
-        switch result {
-        case .success:
-            note("VM running")
-            installProxyListener()
-            connectVsock(attempt: 1)
-        case .failure(let error):
-            fail("VM failed to start: \(error)")
+    if let restorePath = config.restore_path {
+        #if arch(arm64)
+        if #available(macOS 14.0, *) {
+            // Restore requires a stopped VM and leaves it paused.
+            vm.restoreMachineStateFrom(url: URL(fileURLWithPath: restorePath)) { error in
+                if let error {
+                    fail("restoring VM state from \(restorePath): \(error)")
+                }
+                vm.resume { result in
+                    switch result {
+                    case .success: guestIsRunning("restored")
+                    case .failure(let e): fail("resume after restore: \(e)")
+                    }
+                }
+            }
+        } else {
+            fail("restore requires macOS 14+")
+        }
+        #else
+        fail("restore is arm64-only")
+        #endif
+    } else {
+        vm.start { result in
+            switch result {
+            case .success: guestIsRunning("fresh boot")
+            case .failure(let error):
+                fail("VM failed to start: \(error)")
+            }
         }
     }
 }

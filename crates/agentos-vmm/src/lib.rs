@@ -77,6 +77,20 @@ pub trait VmmBackend: Send + Sync {
     /// Boot a microVM for `spec`. Returns once the VMM process is spawned;
     /// the caller completes the guest-agent handshake via [`VmHandle::connect_vsock`].
     async fn create(&self, spec: &SandboxSpec, paths: &SandboxPaths) -> Result<Box<dyn VmHandle>>;
+
+    /// Bring a snapshotted VM back from `state_path`, resuming the guest
+    /// mid-execution. The configuration must match the one it was saved from,
+    /// so callers pass the same `spec`/`paths`.
+    async fn restore(
+        &self,
+        _spec: &SandboxSpec,
+        _paths: &SandboxPaths,
+        _state_path: &std::path::Path,
+    ) -> Result<Box<dyn VmHandle>> {
+        Err(agentos_core::Error::Unsupported(
+            "this backend cannot restore snapshots".into(),
+        ))
+    }
 }
 
 /// A handle to one running microVM.
@@ -100,6 +114,10 @@ pub trait VmHandle: Send + Sync {
 
     /// Unfreeze a paused guest.
     async fn resume(&mut self) -> Result<()>;
+
+    /// Write the VM's live state to `path` and stop it, so it can be brought
+    /// back later with [`VmmBackend::restore`]. The VM is gone afterwards.
+    async fn snapshot(&mut self, path: &std::path::Path) -> Result<()>;
 
     /// The kill switch: destroy the VMM process immediately (SIGKILL-grade).
     /// Must be absolute — no graceful shutdown, nothing the guest can delay.

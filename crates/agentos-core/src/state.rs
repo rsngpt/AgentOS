@@ -23,6 +23,9 @@ pub enum SandboxState {
     /// vCPUs frozen via `agentos pause`. The sandbox still holds its VM and
     /// grants; `resume` continues exactly where it left off.
     Paused,
+    /// VM state written to disk via `agentos snapshot` and the VM torn down.
+    /// The sandbox dir (state file + overlay) survives for `agentos restore`.
+    Snapshotted,
     /// The guest command exited on its own.
     Exited { info: ExitInfo },
     /// Terminated via the kill switch (manual or auto-kill rule).

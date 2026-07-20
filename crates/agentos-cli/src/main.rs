@@ -56,6 +56,13 @@ async fn main() {
                 println!("resumed");
                 0
             }),
+        Command::Snapshot { id } => client::unary("sandbox.snapshot", json!({ "id": id }))
+            .await
+            .map(|v| {
+                println!("snapshotted; state in {}", v["dir"].as_str().unwrap_or("?"));
+                0
+            }),
+        Command::Restore { id } => client::restore(&id).await,
         Command::Events => client::events().await,
     };
 
