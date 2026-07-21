@@ -53,34 +53,27 @@ impl Default for CloudHypervisorBackend {
     }
 }
 
-fn vsock_socket(sandbox_dir: &Path) -> PathBuf {
-    sandbox_dir.join("vsock.sock")
-}
-
-#[async_trait::async_trait]
-impl VmmBackend for CloudHypervisorBackend {
-    fn name(&self) -> &'static str {
-        "cloud-hypervisor"
-    }
-
-    fn proxy_socket_path(&self, sandbox_dir: &Path) -> PathBuf {
-        // CH's hybrid vsock convention: guest connections to port P arrive on
-        // "<socket>_P". The daemon must bind its proxy exactly there.
-        let mut name = vsock_socket(sandbox_dir).into_os_string();
-        name.push(format!("_{HOST_PROXY_PORT}"));
-        PathBuf::from(name)
-    }
-
-    async fn create(&self, spec: &SandboxSpec, paths: &SandboxPaths) -> Result<Box<dyn VmHandle>> {
+impl CloudHypervisorBackend {
+    /// One `virtiofsd` per share (RO enforced by virtiofsd, not the guest).
+    /// Returns the children plus the `--fs` arguments naming their sockets.
+    /// A restore needs these running again before CH can reattach the shares.
+    async fn spawn_virtiofsds(
+        &self,
+        spec: &SandboxSpec,
+        paths: &SandboxPaths,
+    ) -> Result<(Vec<Child>, Vec<String>)> {
         let dir = &paths.sandbox_dir;
-        let vsock = vsock_socket(dir);
-
-        // One virtiofsd per share; RO enforced by virtiofsd, not the guest.
         let mut virtiofsds = Vec::new();
-        let mut fs_args: Vec<String> = Vec::new();
+        let mut fs_args = Vec::new();
         for (i, m) in spec.mounts.iter().enumerate() {
             let sock = dir.join(format!("fs{i}.sock"));
-            let log = std::fs::File::create(dir.join(format!("fs{i}.log")))?;
+            // Stale socket from a previous run would make CH connect to
+            // nothing; virtiofsd won't bind over it either.
+            let _ = std::fs::remove_file(&sock);
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("fs{i}.log")))?;
             let mut cmd = Command::new(&self.virtiofsd_bin);
             // --sandbox none: the default (namespace) needs unprivileged user
             // namespaces, which Ubuntu 24.04+ blocks via AppArmor. virtiofsd
@@ -105,20 +98,17 @@ impl VmmBackend for CloudHypervisorBackend {
                 Error::Backend(format!("spawn {}: {e}", self.virtiofsd_bin.display()))
             })?;
             virtiofsds.push(child);
-            fs_args.push(format!(
-                "tag={},socket={}",
-                crate::share_tag(i),
-                sock.display()
-            ));
+            fs_args.push(format!("tag={},socket={}", crate::share_tag(i), sock.display()));
         }
+
         // vhost-user needs the socket to exist before CH starts. If a
         // virtiofsd died instead, surface its own words.
         for (i, _) in spec.mounts.iter().enumerate() {
             if let Err(e) =
                 wait_for_path(&dir.join(format!("fs{i}.sock")), Duration::from_secs(3)).await
             {
-                let log = std::fs::read_to_string(dir.join(format!("fs{i}.log")))
-                    .unwrap_or_default();
+                let log =
+                    std::fs::read_to_string(dir.join(format!("fs{i}.log"))).unwrap_or_default();
                 let log = log.trim();
                 return Err(Error::Backend(format!(
                     "{e}{}{}",
@@ -127,6 +117,33 @@ impl VmmBackend for CloudHypervisorBackend {
                 )));
             }
         }
+        Ok((virtiofsds, fs_args))
+    }
+}
+
+fn vsock_socket(sandbox_dir: &Path) -> PathBuf {
+    sandbox_dir.join("vsock.sock")
+}
+
+#[async_trait::async_trait]
+impl VmmBackend for CloudHypervisorBackend {
+    fn name(&self) -> &'static str {
+        "cloud-hypervisor"
+    }
+
+    fn proxy_socket_path(&self, sandbox_dir: &Path) -> PathBuf {
+        // CH's hybrid vsock convention: guest connections to port P arrive on
+        // "<socket>_P". The daemon must bind its proxy exactly there.
+        let mut name = vsock_socket(sandbox_dir).into_os_string();
+        name.push(format!("_{HOST_PROXY_PORT}"));
+        PathBuf::from(name)
+    }
+
+    async fn create(&self, spec: &SandboxSpec, paths: &SandboxPaths) -> Result<Box<dyn VmHandle>> {
+        let dir = &paths.sandbox_dir;
+        let vsock = vsock_socket(dir);
+
+        let (virtiofsds, fs_args) = self.spawn_virtiofsds(spec, paths).await?;
 
         let cmdline = if cfg!(target_arch = "aarch64") {
             "console=ttyAMA0"
@@ -201,6 +218,65 @@ impl VmmBackend for CloudHypervisorBackend {
             api_socket,
             ch_remote: bin_from_env("CH_REMOTE", "ch-remote"),
         }))
+    }
+
+    async fn restore(
+        &self,
+        spec: &SandboxSpec,
+        paths: &SandboxPaths,
+        state_path: &std::path::Path,
+    ) -> Result<Box<dyn VmHandle>> {
+        if !state_path.exists() {
+            return Err(Error::Backend(format!(
+                "no saved VM state at {}",
+                state_path.display()
+            )));
+        }
+        let dir = &paths.sandbox_dir;
+        let vsock = vsock_socket(dir);
+        let api_socket = dir.join("api.sock");
+        let _ = std::fs::remove_file(&api_socket);
+        // The snapshot references the vsock socket path; CH recreates it.
+        let _ = std::fs::remove_file(&vsock);
+
+        // The shares must be served again before CH reattaches them: the
+        // snapshot holds the vhost-user connection, not the daemon behind it.
+        let (virtiofsds, _fs_args) = self.spawn_virtiofsds(spec, paths).await?;
+
+        // Restoring takes the whole device model from the snapshot, so no
+        // --kernel/--disk/--fs here; only the API socket and the source.
+        let args = vec![
+            "--api-socket".to_string(),
+            api_socket.display().to_string(),
+            "--restore".to_string(),
+            format!("source_url=file://{}", state_path.display()),
+        ];
+        tracing::info!(bin = %self.ch_bin.display(), ?args, "restoring cloud-hypervisor");
+
+        let ch_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("helper.log"))?;
+        let child = Command::new(&self.ch_bin)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(ch_log.try_clone()?))
+            .stderr(Stdio::from(ch_log))
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| Error::Backend(format!("spawn {}: {e}", self.ch_bin.display())))?;
+
+        let handle = ChVmHandle {
+            child,
+            virtiofsds,
+            vsock,
+            api_socket,
+            ch_remote: bin_from_env("CH_REMOTE", "ch-remote"),
+        };
+        // A restored VM comes back paused; the guest only runs once resumed.
+        wait_for_path(&handle.api_socket, Duration::from_secs(10)).await?;
+        handle.ch_remote("resume").await?;
+        Ok(Box::new(handle))
     }
 }
 
