@@ -189,6 +189,22 @@ pub struct RepoSpec {
 /// Guest path the cloned repo is mounted at (and the command's working dir).
 pub const REPO_GUEST_PATH: &str = "/workspace";
 
+/// Does allowlist entry `pattern` cover `host`? Exact match, or a leading
+/// `*.` wildcard covering any subdomain but **not** the apex.
+///
+/// Lives here because both the egress proxy (per-connection verdicts) and the
+/// fleet policy (is this allowlist within the admin's?) must agree exactly —
+/// two implementations of this would be a policy-bypass waiting to happen.
+pub fn host_matches(pattern: &str, host: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        host.len() > suffix.len() + 1
+            && host.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase())
+            && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+    } else {
+        pattern.eq_ignore_ascii_case(host)
+    }
+}
+
 /// Named starter environments (PRD §7): each presets a network allowlist so
 /// the ecosystem's package tooling works without hand-writing `--net`. The
 /// runtimes themselves already ship in the guest rootfs.

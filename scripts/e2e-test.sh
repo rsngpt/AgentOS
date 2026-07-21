@@ -149,6 +149,27 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+echo "== fleet policy: enforced in the daemon, not the client =="
+POLICY_DIR=$(mktemp -d)
+cat > "$POLICY_DIR/policy.json" <<'POLICY'
+{"message":"contact IT","max_net":{"mode":"allowlist","hosts":["pypi.org"]},"max_vcpus":1}
+POLICY
+# Restart the daemon under a policy; the CLI is unchanged, proving the
+# enforcement point is the daemon.
+pkill -f "$(basename "$AGENTOS")d" 2>/dev/null; sleep 1
+AGENTOS_POLICY="$POLICY_DIR/policy.json" "${AGENTOS}d" >/dev/null 2>&1 &
+sleep 2
+out=$("$AGENTOS" run --net full -- echo x 2>&1 | tail -1)
+case "$out" in
+    *"fleet policy forbids"*) echo "PASS: policy refuses network beyond its ceiling" ;;
+    *) echo "FAIL: policy did not refuse --net full — got [$out]" >&2; FAILURES=$((FAILURES + 1)) ;;
+esac
+out=$("$AGENTOS" run --vcpus 8 -- sh -c 'nproc' 2>/dev/null)
+check "policy clamps vcpus" "1" "$out"
+check "a permitted subset still runs" "ok" "$("$AGENTOS" run --net allowlist:pypi.org -- echo ok 2>/dev/null)"
+rm -rf "$POLICY_DIR"
+pkill -f "$(basename "$AGENTOS")d" 2>/dev/null; sleep 1
+
 echo "== kill switch: save disposition =="
 "$AGENTOS" run -- sleep 60 >/dev/null 2>&1 &
 runner=$!

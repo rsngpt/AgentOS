@@ -34,6 +34,38 @@ async fn emit(
     w.flush().await
 }
 
+/// Resolve every mount to a canonical host path, rejecting anything that
+/// isn't an existing directory. Doing this before policy evaluation is what
+/// stops a symlink from pointing a permitted path at a denied one.
+fn canonicalize_mounts(mut spec: SandboxSpec) -> Result<SandboxSpec> {
+    for m in &mut spec.mounts {
+        let canon = m
+            .host_path
+            .canonicalize()
+            .map_err(|e| Error::InvalidSpec(format!("mount {}: {e}", m.host_path.display())))?;
+        if !canon.is_dir() {
+            return Err(Error::InvalidSpec(format!(
+                "mount {} is not a directory",
+                canon.display()
+            )));
+        }
+        m.host_path = canon;
+    }
+    Ok(spec)
+}
+
+/// Hold a spec to the machine's fleet policy (PRD §7). Reloaded per run so an
+/// admin's change takes effect without restarting the daemon.
+fn apply_fleet_policy(spec: SandboxSpec) -> Result<SandboxSpec> {
+    let policy = agentos_core::FleetPolicy::load()?;
+    if policy.is_empty() {
+        return Ok(spec);
+    }
+    let out = policy.apply(spec)?;
+    tracing::debug!("fleet policy applied");
+    Ok(out)
+}
+
 /// Per-sandbox directory: overlay, logs, saved VM state, cloned workspace.
 pub fn sandbox_dir(id: &agentos_core::SandboxId) -> PathBuf {
     agentos_home().join("sandboxes").join(id.to_string())
@@ -76,6 +108,18 @@ pub async fn run_sandbox(
     spec: SandboxSpec,
     client: &mut (impl AsyncWrite + Unpin),
 ) -> std::io::Result<()> {
+    // Fleet policy is applied *here*, in the daemon, not in any client: a user
+    // can run their own CLI, so anything a client could skip is not a control.
+    // Mounts are canonicalised first so a symlink can't smuggle a denied path
+    // past `deny_mounts`.
+    let spec = match canonicalize_mounts(spec).and_then(apply_fleet_policy) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!(error = %e, "sandbox refused before start");
+            return emit(client, json!({ "event": "error", "message": e.to_string() })).await;
+        }
+    };
+
     let id = registry.create(spec.clone()).await;
     emit(client, json!({ "event": "created", "id": id })).await?;
 
@@ -173,18 +217,8 @@ async fn drive(
             )));
         }
     }
-    for m in &mut spec.mounts {
-        let canon = m.host_path.canonicalize().map_err(|e| {
-            Error::InvalidSpec(format!("mount {}: {e}", m.host_path.display()))
-        })?;
-        if !canon.is_dir() {
-            return Err(Error::InvalidSpec(format!(
-                "mount {} is not a directory",
-                canon.display()
-            )));
-        }
-        m.host_path = canon;
-    }
+    // Mounts were canonicalised and policy-checked in run_sandbox, before the
+    // sandbox was registered.
 
     let sandbox_dir = home.join("sandboxes").join(id.to_string());
     std::fs::create_dir_all(&sandbox_dir)?;

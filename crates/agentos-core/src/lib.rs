@@ -8,11 +8,13 @@
 
 pub mod error;
 pub mod event;
+pub mod policy;
 pub mod protocol;
 pub mod spec;
 pub mod state;
 
 pub use error::{Error, Result};
+pub use policy::FleetPolicy;
 pub use spec::{
     template_net, AutoKillRules, MountMode, MountSpec, NetPolicy, RepoSpec, ResourceLimits,
     SandboxId, SandboxSpec, TerminationDisposition, REPO_GUEST_PATH, TEMPLATES,

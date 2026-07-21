@@ -18,6 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use agentos_core::event::EventKind;
+// Allowlist matching lives in core so the fleet policy validates subsets with
+// exactly the rule the proxy enforces per connection — two copies of this
+// would be a policy bypass waiting to happen.
+use agentos_core::spec::host_matches;
 use agentos_core::{NetPolicy, SandboxId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
@@ -337,18 +341,6 @@ fn is_local_ip(ip: &IpAddr) -> bool {
                     })
                     .is_some_and(|v4| is_local_ip(&IpAddr::V4(v4)))
         }
-    }
-}
-
-/// Match `pattern` against `host`: exact, or a leading `*.` wildcard that
-/// matches any subdomain (but not the apex).
-fn host_matches(pattern: &str, host: &str) -> bool {
-    if let Some(suffix) = pattern.strip_prefix("*.") {
-        host.len() > suffix.len() + 1
-            && host.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase())
-            && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
-    } else {
-        pattern.eq_ignore_ascii_case(host)
     }
 }
 

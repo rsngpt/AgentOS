@@ -63,6 +63,19 @@ async fn main() {
                 0
             }),
         Command::Restore { id } => client::restore(&id).await,
+        Command::Policy => match agentos_core::FleetPolicy::load() {
+            Ok(p) if p.is_empty() => {
+                println!("no fleet policy in effect on this machine");
+                println!("(a managed deployment would place one at {})",
+                    agentos_core::policy::SYSTEM_POLICY_PATH);
+                Ok(0)
+            }
+            Ok(p) => {
+                println!("{}", serde_json::to_string_pretty(&p).unwrap_or_default());
+                Ok(0)
+            }
+            Err(e) => Err(e.to_string()),
+        },
         Command::Events => client::events().await,
     };
 

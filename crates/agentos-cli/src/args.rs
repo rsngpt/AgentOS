@@ -54,6 +54,8 @@ pub enum Command {
         /// Sandbox id (from `agentos ps`).
         id: String,
     },
+    /// Show the fleet policy this machine enforces, if any.
+    Policy,
     /// Stream daemon events (state changes, network verdicts, resource samples).
     Events,
 }

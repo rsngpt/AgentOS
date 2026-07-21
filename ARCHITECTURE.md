@@ -152,7 +152,21 @@ Provisioning → Booting → Running → Exited
 - **M2 — Policy**: ✅ done. virtio-fs mounts (RO/RW, host-enforced — a root guest remounting rw still cannot write), egress proxy with all three network modes (localhost/LAN blocked even in `full`, DNS resolved host-side with local-address filtering), kill switch save|wipe dispositions, and auto-kill on memory/egress/runtime with incremental egress counting. This is the PRD's MVP feature bar.
 - **M3 — Linux backend**: ✅ done, CI-verified. `CloudHypervisorBackend` spawns `cloud-hypervisor` (hybrid vsock, no NIC, one unprivileged `virtiofsd --sandbox none` per mount with host-side `--readonly` — virtiofsd ≥ 1.11 required; the backend fails closed, quoting virtiofsd's stderr, rather than ever running an RO mount unenforced); guest-initiated egress lands on the `<vsock_socket>_1025` Unix socket where the daemon binds its proxy (`VmmBackend::proxy_socket_path`). The shared e2e suite (`scripts/e2e-test.sh`, 11 assertions) passes on macOS/vz locally and on real KVM Cloud Hypervisor microVMs in CI (`.github/workflows/ci.yml`).
 - **M4 — GUI**: ✅ done. Tauri desktop app (`gui/`, vanilla static frontend — no npm toolchain) over the same socket as the CLI, via the shared `agentos-client` crate: sandbox list with live states, permission form (mounts/net/limits/auto-kill), streaming terminal, network monitor fed by the daemon's event bus (`events.subscribe` broadcasts `StateChanged`/`NetVerdict`/`ResourceSample`/`AutoKillTriggered`), and per-sandbox Terminate / kill+save buttons. `agentos events` streams the same bus in the CLI.
-- **Later**: Windows backend, enterprise fleet policy (per PRD §7).
+- **Later**: Windows backend.
+
+## 13. Enterprise fleet policy (PRD §7)
+
+A machine-wide `FleetPolicy` (JSON) that every sandbox is held to: a network ceiling (`max_net`), `deny_mounts` paths, `force_mounts_read_only`, `allow_repo`, vCPU/RAM/disk caps, and auto-kill ceilings. It can only ever *tighten* a request. Hard limits (network, mounts, git) **refuse** the run with a message naming the policy — including the admin's own `message`, so the user knows who to ask — while resource requests above a cap are **clamped**, matching existing quota behaviour.
+
+Three details that matter more than the schema:
+
+- **Enforcement is in `agentosd`, never in a client.** A user can run their own CLI or none at all, so anything a client could skip is not a control. The e2e proves this by changing only the daemon's policy and using the stock CLI.
+- **Mount paths are canonicalised before evaluation**, so a symlink cannot disguise a denied path — and the deny list is canonicalised *too*. Missing that second half made the policy silently permit what it claimed to deny (an admin writing `/tmp/x` on macOS, where `/tmp` → `/private/tmp`, denied nothing). There's a regression test.
+- **Allowlist subset checks reuse the proxy's own matcher** (`agentos_core::spec::host_matches`). Two implementations of that rule would be a policy bypass waiting to happen.
+
+Loading: `/Library/Application Support/AgentOS/policy.json` (macOS) or `/etc/agentos/policy.json`, reloaded per run so an admin's change lands without restarting the daemon. `AGENTOS_POLICY` overrides **only when no system policy exists**, so the env var is usable for testing but cannot weaken a deployed policy. Unknown JSON fields are rejected, so a typo'd key fails loudly instead of silently disabling a limit.
+
+**What this is not.** `agentosd` runs as the user, so a machine's owner can replace the binary or the policy file. This is a guardrail for managed fleets — it stops an agent, and a careless user, from exceeding what IT allows — not a boundary against a determined local admin. Deploy the file root-owned and read-only for real assurance. The hypervisor-level guarantees (§2) are unaffected either way: they hold regardless of policy.
 
 ## 12. Snapshotting (PRD §7)
 
