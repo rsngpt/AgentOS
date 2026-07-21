@@ -12,6 +12,7 @@
 //! - all transferred bytes counted toward the sandbox's egress quota
 
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -138,7 +139,7 @@ async fn handle_connection(
         return refuse(&mut guest, "403 Forbidden").await;
     }
 
-    let mut upstream = match TcpStream::connect(addrs.as_slice()).await {
+    let mut upstream = match connect_first(&addrs).await {
         Ok(s) => s,
         Err(e) => {
             warn!(%host, port, error = %e, "upstream connect failed");
@@ -196,6 +197,47 @@ async fn counted_copy(
             }
         }
     }
+}
+
+/// Per-address budget when dialling upstream. Without this, a single
+/// blackholed address (a network advertising IPv6 that silently drops it is
+/// common) stalls the request for the OS TCP timeout — minutes — long past any
+/// client's patience. Browsers dodge this with Happy Eyeballs; we bound each
+/// attempt and move on.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Dial the first address that answers, trying IPv4 before IPv6 and giving each
+/// a bounded budget. Guests have no direct network, so every connection is
+/// ours to make robust: IPv6-only destinations still work, they just come
+/// after the more reliably-routed v4 candidates.
+async fn connect_first(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
+    let mut ordered: Vec<SocketAddr> = Vec::with_capacity(addrs.len());
+    for addr in addrs.iter().filter(|a| a.is_ipv4()).chain(addrs.iter().filter(|a| a.is_ipv6())) {
+        if !ordered.contains(addr) {
+            ordered.push(*addr); // resolvers routinely hand back duplicates
+        }
+    }
+
+    let mut last_err = None;
+    for addr in ordered {
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => {
+                debug!(%addr, error = %e, "upstream candidate refused");
+                last_err = Some(e);
+            }
+            Err(_) => {
+                debug!(%addr, "upstream candidate timed out");
+                last_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("connecting to {addr} timed out after {CONNECT_TIMEOUT:?}"),
+                ));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no usable address")
+    }))
 }
 
 fn find_head_end(buf: &[u8]) -> Option<usize> {

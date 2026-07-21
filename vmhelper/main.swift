@@ -47,6 +47,10 @@ struct HelperConfig: Codable {
     var proxy_port: UInt32?
     /// Where SIGHUP writes the saved VM state (snapshot).
     var save_path: String?
+    /// Persisted machine identity. A restore only accepts a configuration
+    /// whose machineIdentifier matches the saved VM's, and the identifier is
+    /// otherwise regenerated at random on every launch.
+    var machine_id_path: String?
     /// When set, boot by restoring this saved state instead of starting fresh.
     var restore_path: String?
 }
@@ -80,6 +84,27 @@ bootLoader.commandLine = config.cmdline
 
 let vmConfig = VZVirtualMachineConfiguration()
 vmConfig.bootLoader = bootLoader
+
+// Machine identity must survive save -> restore: VZ rejects a restore whose
+// machineIdentifier differs from the saved VM's ("invalid argument"), and a
+// fresh random one is generated per launch unless we pin it. Persist it in
+// the sandbox dir on first boot and reuse it forever after.
+if #available(macOS 13.0, *), let idPath = config.machine_id_path {
+    let platform = VZGenericPlatformConfiguration()
+    if let data = FileManager.default.contents(atPath: idPath),
+       let saved = VZGenericMachineIdentifier(dataRepresentation: data) {
+        platform.machineIdentifier = saved
+    } else {
+        let fresh = VZGenericMachineIdentifier()
+        platform.machineIdentifier = fresh
+        do {
+            try fresh.dataRepresentation.write(to: URL(fileURLWithPath: idPath))
+        } catch {
+            note("could not persist machine identifier: \(error) — restore will fail")
+        }
+    }
+    vmConfig.platform = platform
+}
 vmConfig.cpuCount = max(1, min(config.vcpus, VZVirtualMachineConfiguration.maximumAllowedCPUCount))
 vmConfig.memorySize = max(VZVirtualMachineConfiguration.minimumAllowedMemorySize,
                           config.mem_mib * 1024 * 1024)
@@ -346,6 +371,9 @@ saveSource.setEventHandler {
             _ = listener
             proxyListener = nil
         }
+        // saveMachineStateTo will not overwrite, so clear any earlier snapshot
+        // (re-snapshotting a restored sandbox is normal).
+        try? FileManager.default.removeItem(atPath: savePath)
         vm.saveMachineStateTo(url: URL(fileURLWithPath: savePath)) { error in
             if let error {
                 fail("saving VM state: \(error)")

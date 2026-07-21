@@ -138,12 +138,19 @@ impl VzBackend {
             "proxy_socket": paths.proxy_socket,
             "proxy_port": paths.proxy_socket.as_ref().map(|_| agentos_core::HOST_PROXY_PORT),
             "save_path": paths.sandbox_dir.join("vmstate"),
+            "machine_id_path": paths.sandbox_dir.join("machine-id"),
             "restore_path": restore_from,
         });
         let config_path = paths.sandbox_dir.join("vmconfig.json");
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
 
-        let helper_log = std::fs::File::create(paths.sandbox_dir.join("helper.log"))?;
+        // Append: a sandbox can outlive several helper processes (snapshot →
+        // restore), and truncating would discard the diagnostics from the run
+        // that failed.
+        let helper_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(paths.sandbox_dir.join("helper.log"))?;
         let mut child = Command::new(&self.helper)
             .arg(&config_path)
             .stdin(Stdio::piped())

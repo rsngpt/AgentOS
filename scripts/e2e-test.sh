@@ -114,6 +114,41 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+echo "== snapshot/restore: guest resumes mid-execution =="
+"$AGENTOS" run -- sh -c 'i=0; while [ $i -lt 120 ]; do echo "s$i"; i=$((i+1)); sleep 1; done' \
+    > /tmp/agentos-e2e-snap.txt 2>&1 &
+snapper=$!
+sleep 7
+id=$("$AGENTOS" ps | awk '$3=="running"{print $1; exit}')
+if [ -n "$id" ]; then
+    last_before=$(grep -c '^s' /tmp/agentos-e2e-snap.txt)
+    "$AGENTOS" snapshot "$id" >/dev/null 2>&1
+    check "state is snapshotted" "snapshotted" "$("$AGENTOS" ps | awk -v i="$id" '$1==i{print $3}')"
+    wait "$snapper" 2>/dev/null
+    "$AGENTOS" restore "$id" > /tmp/agentos-e2e-restored.txt 2>&1 &
+    restorer=$!
+    sleep 10
+    # The restored guest must CONTINUE mid-execution: it picks up near where
+    # it stopped (a line buffered at snapshot time may be replayed, which is
+    # correct — no output is lost) and runs on past that point. What must NOT
+    # happen is re-running the command from scratch at s0.
+    first_after=$(grep '^s' /tmp/agentos-e2e-restored.txt | head -1 | tr -d 's')
+    last_after=$(grep '^s' /tmp/agentos-e2e-restored.txt | tail -1 | tr -d 's')
+    if [ -n "$first_after" ] && [ "$first_after" -gt 0 ] \
+        && [ -n "$last_after" ] && [ "$last_after" -ge "$last_before" ]; then
+        echo "PASS: restored guest resumed at s$first_after and ran to s$last_after (snapshot after s$((last_before - 1)))"
+    else
+        echo "FAIL: restored guest did not resume mid-execution (first=${first_after:-none}, last=${last_after:-none}, snapshot after s$((last_before - 1)))" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+    "$AGENTOS" kill "$id" >/dev/null 2>&1
+    wait "$restorer" 2>/dev/null
+else
+    echo "FAIL: snapshot/restore — no running sandbox found" >&2
+    kill "$snapper" 2>/dev/null
+    FAILURES=$((FAILURES + 1))
+fi
+
 echo "== kill switch: save disposition =="
 "$AGENTOS" run -- sleep 60 >/dev/null 2>&1 &
 runner=$!
