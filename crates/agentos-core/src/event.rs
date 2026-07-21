@@ -30,6 +30,9 @@ pub enum EventKind {
         cpu_percent: u32,
         mem_mib: u32,
         egress_total_bytes: u64,
+        /// Overlay space in use, i.e. what the agent has written.
+        #[serde(default)]
+        disk_used_mib: u32,
     },
     /// An auto-kill rule fired; a `StateChanged` to `Killed` follows.
     AutoKillTriggered { rule: String },

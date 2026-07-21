@@ -45,6 +45,7 @@ pub async fn watch(
     rules: AutoKillRules,
     guest_cpu_percent: Arc<AtomicU32>,
     guest_mem_mib: Arc<AtomicU32>,
+    guest_disk_mib: Arc<AtomicU32>,
     egress_bytes: Arc<AtomicU64>,
 ) {
     let started = Instant::now();
@@ -62,6 +63,7 @@ pub async fn watch(
                 cpu_percent,
                 mem_mib: mem,
                 egress_total_bytes: egress_total,
+                disk_used_mib: guest_disk_mib.load(Ordering::Relaxed),
             },
         );
         if let Some(rule) = breached_rule(&rules, mem, egress_mib, runtime) {

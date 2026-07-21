@@ -203,8 +203,13 @@ vm.delegate = delegate
 @Sendable func startRelay(connFd: Int32) {
     Thread.detachNewThread {
         relayLoop(0, connFd)
-        // stdin closed: daemon went away; half-close towards the guest.
+        // Our stdin is the daemon's pipe, so EOF means the daemon is gone —
+        // crashed, killed, or shut down. A sandbox VM must never outlive its
+        // supervisor: exiting here destroys the VM, which is the same
+        // fail-closed guarantee the kill switch relies on.
         shutdown(connFd, SHUT_WR)
+        note("daemon disconnected; destroying VM")
+        exit(0)
     }
     Thread.detachNewThread {
         relayLoop(connFd, 1)

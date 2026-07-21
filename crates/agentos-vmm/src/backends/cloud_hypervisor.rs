@@ -23,6 +23,30 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
+/// Make a child die with this process.
+///
+/// A sandbox VM (or a virtiofsd serving its mounts) must never outlive the
+/// daemon supervising it: `kill_on_drop` only covers an orderly shutdown, so a
+/// SIGKILLed daemon would otherwise leak running VMs. `PDEATHSIG` is delivered
+/// when the *spawning thread* exits, which for a tokio worker means the
+/// runtime's lifetime — the behaviour we want.
+fn die_with_parent(cmd: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
+}
+
 use crate::{SandboxPaths, VmHandle, VmState, VmmBackend, VsockStream};
 
 const CONNECT_RETRIES: u32 = 150; // x 100ms = 15s boot budget
@@ -94,6 +118,7 @@ impl CloudHypervisorBackend {
             if m.mode == agentos_core::MountMode::ReadOnly {
                 cmd.arg("--readonly");
             }
+            die_with_parent(&mut cmd);
             let child = cmd.spawn().map_err(|e| {
                 Error::Backend(format!("spawn {}: {e}", self.virtiofsd_bin.display()))
             })?;
@@ -202,12 +227,14 @@ impl VmmBackend for CloudHypervisorBackend {
         tracing::info!(bin = %self.ch_bin.display(), ?args, "spawning cloud-hypervisor");
 
         let ch_log = std::fs::File::create(dir.join("helper.log"))?;
-        let child = Command::new(&self.ch_bin)
-            .args(&args)
+        let mut cmd = Command::new(&self.ch_bin);
+        cmd.args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::from(ch_log.try_clone()?))
             .stderr(Stdio::from(ch_log))
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        die_with_parent(&mut cmd);
+        let child = cmd
             .spawn()
             .map_err(|e| Error::Backend(format!("spawn {}: {e}", self.ch_bin.display())))?;
 
@@ -257,12 +284,14 @@ impl VmmBackend for CloudHypervisorBackend {
             .create(true)
             .append(true)
             .open(dir.join("helper.log"))?;
-        let child = Command::new(&self.ch_bin)
-            .args(&args)
+        let mut cmd = Command::new(&self.ch_bin);
+        cmd.args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::from(ch_log.try_clone()?))
             .stderr(Stdio::from(ch_log))
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        die_with_parent(&mut cmd);
+        let child = cmd
             .spawn()
             .map_err(|e| Error::Backend(format!("spawn {}: {e}", self.ch_bin.display())))?;
 

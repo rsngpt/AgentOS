@@ -22,6 +22,8 @@ pub struct Cli {
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// Boot a sandbox and run a command in it, attached to its stdio.
+    /// (`start` is an alias, as used in the PRD's user flows.)
+    #[command(alias = "start")]
     Run(RunArgs),
     /// List sandboxes and their states.
     Ps,

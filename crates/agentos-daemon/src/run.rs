@@ -467,12 +467,14 @@ async fn drive(
     // proxy egress bytes, and wall-clock runtime.
     let guest_mem = Arc::new(AtomicU32::new(0));
     let guest_cpu = Arc::new(AtomicU32::new(0));
+    let guest_disk = Arc::new(AtomicU32::new(0));
     let monitor_task = tokio::spawn(monitor::watch(
         registry.clone(),
         id.clone(),
         spec.auto_kill,
         guest_cpu.clone(),
         guest_mem.clone(),
+        guest_disk.clone(),
         egress_bytes.clone(),
     ));
 
@@ -490,9 +492,10 @@ async fn drive(
                     .await
                     .map_err(Error::Io)?;
             }
-            GuestMessage::Metrics { mem_mib, cpu_percent, .. } => {
+            GuestMessage::Metrics { mem_mib, cpu_percent, disk_used_mib } => {
                 guest_mem.store(mem_mib, Ordering::Relaxed);
                 guest_cpu.store(cpu_percent, Ordering::Relaxed);
+                guest_disk.store(disk_used_mib, Ordering::Relaxed);
             }
             GuestMessage::Exited { info } => {
                 exit_info = Some(info);

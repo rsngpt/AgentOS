@@ -207,6 +207,35 @@ check "a permitted subset still runs" "ok" "$("$AGENTOS" run --net allowlist:pyp
 rm -rf "$POLICY_DIR"
 pkill -f "$(basename "$AGENTOS")d" 2>/dev/null; sleep 1
 
+echo "== concurrency: sandboxes are independent =="
+for i in 1 2 3; do
+    ("$AGENTOS" run -- sh -c "echo box-$i; sleep 4; echo box-$i-done" \
+        > "/tmp/agentos-e2e-conc$i.txt" 2>&1 &)
+done
+sleep 9
+conc_ok=yes
+for i in 1 2 3; do
+    grep -q "box-$i-done" "/tmp/agentos-e2e-conc$i.txt" || conc_ok=no
+    # Output must not bleed between sandboxes.
+    for j in 1 2 3; do
+        [ "$i" = "$j" ] && continue
+        grep -q "box-$j" "/tmp/agentos-e2e-conc$i.txt" && conc_ok=no
+    done
+done
+check "three sandboxes run concurrently without interference" "yes" "$conc_ok"
+
+echo "== a VM never outlives its daemon (fail-closed) =="
+"$AGENTOS" run -- sleep 120 >/dev/null 2>&1 &
+orphan_runner=$!
+sleep 6
+pkill -f "$(basename "$AGENTOS")d" 2>/dev/null
+sleep 3
+# kill_on_drop only covers an orderly exit; a SIGKILLed daemon must still take
+# its VMs with it, or a sandbox outlives the thing supervising it.
+leaked=$(pgrep -f 'vmhelper/agentos-vmhelper|cloud-hypervisor' | wc -l | tr -d ' ')
+check "no VM leaks when the daemon dies" "0" "$leaked"
+kill "$orphan_runner" 2>/dev/null; wait "$orphan_runner" 2>/dev/null
+
 echo "== kill switch: save disposition =="
 "$AGENTOS" run -- sleep 60 >/dev/null 2>&1 &
 runner=$!

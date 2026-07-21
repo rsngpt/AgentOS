@@ -389,7 +389,7 @@ mod linux {
                     if tx
                         .send(GuestMessage::Metrics {
                             mem_mib: mem_used_mib(),
-                            disk_used_mib: 0,
+                            disk_used_mib: disk_used_mib(),
                             cpu_percent,
                         })
                         .is_err()
@@ -680,6 +680,25 @@ mod linux {
         };
         let used_kib = field("MemTotal:").saturating_sub(field("MemAvailable:"));
         (used_kib / 1024) as u32
+    }
+
+    /// Bytes written into the writable overlay, in MiB. Measured on the ext4
+    /// overlay itself (`/over`) — that's the filesystem `disk_mib` caps. Falls
+    /// back to the union root, then to whatever `/` is, so the initramfs-only
+    /// path still reports something rather than lying with 0.
+    fn disk_used_mib() -> u32 {
+        for path in ["/over", "/newroot", "/"] {
+            let Ok(c_path) = std::ffi::CString::new(path) else {
+                continue;
+            };
+            let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 || st.f_blocks == 0 {
+                continue;
+            }
+            let used_blocks = (st.f_blocks as u64).saturating_sub(st.f_bfree as u64);
+            return ((used_blocks * st.f_frsize as u64) / (1024 * 1024)) as u32;
+        }
+        0
     }
 
     /// (busy_jiffies, total_jiffies) from the aggregate `cpu` line of /proc/stat.
