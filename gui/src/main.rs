@@ -7,20 +7,40 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use agentos_client::RunEvent;
 use agentos_core::{
     AutoKillRules, MountSpec, NetPolicy, ResourceLimits, SandboxSpec,
 };
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
+/// The GUI drives Agent OS through the same public SDK an embedder would use.
+fn client() -> agentos_client::Client {
+    agentos_client::Client::new()
+}
+
+fn parse_id(id: &str) -> Result<agentos_core::SandboxId, String> {
+    serde_json::from_value(Value::String(id.to_string()))
+        .map_err(|_| format!("not a valid sandbox id: {id}"))
+}
+
 #[tauri::command]
 async fn list_sandboxes() -> Result<Value, String> {
-    agentos_client::unary("sandbox.list", json!(null)).await
+    let rows = client().list().await.map_err(|e| e.to_string())?;
+    let rows: Vec<Value> = rows
+        .into_iter()
+        .map(|sb| json!({ "id": sb.id, "name": sb.name, "state": sb.state }))
+        .collect();
+    Ok(Value::Array(rows))
 }
 
 #[tauri::command]
 async fn kill_sandbox(id: String, save: bool) -> Result<Value, String> {
-    agentos_client::unary("sandbox.kill", json!({ "id": id, "save": save })).await
+    client()
+        .kill(&parse_id(&id)?, save)
+        .await
+        .map(|_| json!({ "killed": true }))
+        .map_err(|e| e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -66,21 +86,18 @@ async fn run_sandbox(
         },
     };
 
-    let mut stream = agentos_client::open_stream(
-        "sandbox.run",
-        serde_json::to_value(&spec).map_err(|e| e.to_string())?,
-    )
-    .await?;
+    let mut stream = client().run(&spec).await.map_err(|e| e.to_string())?;
 
     tauri::async_runtime::spawn(async move {
         loop {
             match stream.next().await {
-                Ok(Some(v)) => {
-                    app.emit("run-line", v).ok();
+                Ok(Some(event)) => {
+                    app.emit("run-line", run_event_json(event)).ok();
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    app.emit("run-line", json!({ "event": "error", "message": e })).ok();
+                    app.emit("run-line", json!({ "event": "error", "message": e.to_string() }))
+                        .ok();
                     break;
                 }
             }
@@ -90,20 +107,43 @@ async fn run_sandbox(
     Ok(())
 }
 
+/// Render an SDK event in the shape the static frontend already consumes.
+fn run_event_json(event: RunEvent) -> Value {
+    match event {
+        RunEvent::Created(id) => json!({ "event": "created", "id": id }),
+        RunEvent::Restoring(id) => json!({ "event": "restoring", "id": id }),
+        RunEvent::Cloning { url } => json!({ "event": "cloning", "url": url }),
+        RunEvent::Running => json!({ "event": "running" }),
+        RunEvent::Stdout(data) => json!({ "event": "stdout", "data": data }),
+        RunEvent::Stderr(data) => json!({ "event": "stderr", "data": data }),
+        RunEvent::Exited { code, signal } => {
+            json!({ "event": "exited", "code": code, "signal": signal })
+        }
+        RunEvent::Terminated { reason, saved_dir } => {
+            json!({ "event": "terminated", "reason": reason, "saved_dir": saved_dir })
+        }
+        RunEvent::Snapshotted { dir } => json!({ "event": "snapshotted", "dir": dir }),
+        RunEvent::Unknown(v) => v,
+    }
+}
+
 /// Panic kill switch: terminate the most-recently-started running sandbox.
 /// Bound to a global hotkey so it works even when the window isn't focused.
 async fn kill_most_recent_running() -> Result<Value, String> {
-    let list = agentos_client::unary("sandbox.list", json!(null)).await?;
-    let running: Option<String> = list
-        .as_array()
-        .and_then(|rows| {
-            rows.iter()
-                .rev()
-                .find(|r| r["state"]["state"] == "running")
-                .and_then(|r| r["id"].as_str().map(String::from))
-        });
+    let c = client();
+    let running = c
+        .list()
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .rev()
+        .find(|sb| matches!(sb.state, agentos_core::SandboxState::Running));
     match running {
-        Some(id) => agentos_client::unary("sandbox.kill", json!({ "id": id, "save": false })).await,
+        Some(sb) => c
+            .kill(&sb.id, false)
+            .await
+            .map(|_| json!({ "killed": true, "id": sb.id }))
+            .map_err(|e| e.to_string()),
         None => Ok(json!({ "killed": false, "reason": "no running sandbox" })),
     }
 }
@@ -112,9 +152,9 @@ async fn kill_most_recent_running() -> Result<Value, String> {
 /// the daemon restarts.
 async fn pump_events(app: AppHandle) {
     loop {
-        if let Ok(mut stream) = agentos_client::open_stream("events.subscribe", json!(null)).await {
-            while let Ok(Some(v)) = stream.next().await {
-                app.emit("agentos-event", v).ok();
+        if let Ok(mut sub) = client().events().await {
+            while let Ok(Some(event)) = sub.next().await {
+                app.emit("agentos-event", event).ok();
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;

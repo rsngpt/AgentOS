@@ -1,90 +1,126 @@
-//! CLI-side presentation over the shared `agentos-client` transport.
+//! CLI presentation on top of the `agentos-client` SDK.
+//!
+//! This file is deliberately thin: if driving Agent OS from the CLI needs
+//! anything the SDK can't express, that's a gap an embedder would hit too.
 
 use std::io::Write as _;
 
-use agentos_core::SandboxSpec;
-use serde_json::{json, Value};
+use agentos_client::{Client, RunEvent};
+use agentos_core::{SandboxId, SandboxSpec};
 
-pub use agentos_client::unary;
-
-/// Run a sandbox, streaming its output to our stdio.
-/// Returns the process exit code to use.
-pub async fn run(spec: SandboxSpec) -> Result<i32, String> {
-    let stream = agentos_client::open_stream(
-        "sandbox.run",
-        serde_json::to_value(&spec).map_err(|e| e.to_string())?,
-    )
-    .await?;
-    stream_run_events(stream).await
+fn client() -> Client {
+    Client::new()
 }
 
-/// Render a run/restore event stream to our stdio, returning the exit code.
-async fn stream_run_events(
-    mut stream: agentos_client::EventStream,
-) -> Result<i32, String> {
+/// Parse a user-supplied sandbox id.
+pub fn parse_id(id: &str) -> Result<SandboxId, String> {
+    serde_json::from_value(serde_json::Value::String(id.to_string()))
+        .map_err(|_| format!("not a valid sandbox id: {id}"))
+}
+
+/// Run a sandbox, streaming its output to our stdio; returns the exit code.
+pub async fn run(spec: SandboxSpec) -> Result<i32, String> {
+    let stream = client().run(&spec).await.map_err(|e| e.to_string())?;
+    stream_run(stream).await
+}
+
+/// Restore a snapshotted sandbox and stream it exactly like `run`.
+pub async fn restore(id: &str) -> Result<i32, String> {
+    let id = parse_id(id)?;
+    let stream = client().restore(&id).await.map_err(|e| e.to_string())?;
+    stream_run(stream).await
+}
+
+async fn stream_run(mut stream: agentos_client::RunStream) -> Result<i32, String> {
     let mut stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
-    while let Some(v) = stream.next().await? {
-        if let Some(err) = v.get("error") {
-            return Err(err["message"].as_str().unwrap_or("unknown error").to_string());
-        }
-        match v["event"].as_str() {
-            Some("created") => {
-                eprintln!("sandbox {} created", v["id"].as_str().unwrap_or("?"));
-            }
-            Some("restoring") => {
-                eprintln!("restoring sandbox {}", v["id"].as_str().unwrap_or("?"));
-            }
-            Some("snapshotted") => {
-                eprintln!("sandbox snapshotted; state in {}", v["dir"].as_str().unwrap_or("?"));
-                return Ok(0);
-            }
-            Some("running") => {}
-            Some("stdout") => {
-                stdout.write_all(&bytes(&v["data"])).map_err(|e| e.to_string())?;
+    loop {
+        let event = stream.next().await.map_err(|e| e.to_string())?;
+        let Some(event) = event else {
+            return Err("daemon connection closed unexpectedly".into());
+        };
+        match event {
+            RunEvent::Created(id) => eprintln!("sandbox {id} created"),
+            RunEvent::Restoring(id) => eprintln!("restoring sandbox {id}"),
+            RunEvent::Cloning { url } => eprintln!("cloning {url}"),
+            RunEvent::Running | RunEvent::Unknown(_) => {}
+            RunEvent::Stdout(data) => {
+                stdout.write_all(&data).map_err(|e| e.to_string())?;
                 stdout.flush().ok();
             }
-            Some("stderr") => {
-                stderr.write_all(&bytes(&v["data"])).map_err(|e| e.to_string())?;
+            RunEvent::Stderr(data) => {
+                stderr.write_all(&data).map_err(|e| e.to_string())?;
                 stderr.flush().ok();
             }
-            Some("exited") => {
-                return Ok(v["code"].as_i64().unwrap_or(1) as i32);
-            }
-            Some("terminated") => {
-                let reason = v["reason"].as_str().unwrap_or("kill switch");
+            RunEvent::Exited { code, .. } => return Ok(code.unwrap_or(1)),
+            RunEvent::Terminated { reason, saved_dir } => {
                 eprintln!("sandbox terminated ({reason})");
-                if let Some(dir) = v["saved_dir"].as_str() {
+                if let Some(dir) = saved_dir {
                     eprintln!("sandbox state saved at {dir}");
                 }
                 return Ok(137);
             }
-            Some("error") => {
-                return Err(v["message"].as_str().unwrap_or("unknown error").to_string());
+            RunEvent::Snapshotted { dir } => {
+                eprintln!("sandbox snapshotted; state in {dir}");
+                return Ok(0);
             }
-            _ => {}
         }
     }
-    Err("daemon connection closed unexpectedly".into())
 }
 
-fn bytes(v: &Value) -> Vec<u8> {
-    v.as_array()
-        .map(|a| a.iter().filter_map(|b| b.as_u64().map(|b| b as u8)).collect())
-        .unwrap_or_default()
+pub async fn list() -> Result<i32, String> {
+    let rows = client().list().await.map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        println!("no sandboxes");
+        return Ok(0);
+    }
+    println!("{:<38} {:<16} STATE", "ID", "NAME");
+    for sb in rows {
+        // The state enum is tagged, so its JSON tag is the display name.
+        let state = serde_json::to_value(&sb.state)
+            .ok()
+            .and_then(|v| v["state"].as_str().map(String::from))
+            .unwrap_or_else(|| "?".into());
+        println!("{:<38} {:<16} {}", sb.id.to_string(), sb.name, state);
+    }
+    Ok(0)
 }
 
-/// Restore a snapshotted sandbox and stream its output like `run` does.
-pub async fn restore(id: &str) -> Result<i32, String> {
-    let stream = agentos_client::open_stream("sandbox.restore", json!({ "id": id })).await?;
-    stream_run_events(stream).await
+pub async fn kill(id: &str, save: bool) -> Result<i32, String> {
+    client()
+        .kill(&parse_id(id)?, save)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("killed");
+    Ok(0)
 }
 
-/// Stream daemon events to stdout as JSON lines until interrupted.
+pub async fn pause(id: &str) -> Result<i32, String> {
+    client().pause(&parse_id(id)?).await.map_err(|e| e.to_string())?;
+    println!("paused");
+    Ok(0)
+}
+
+pub async fn resume(id: &str) -> Result<i32, String> {
+    client().resume(&parse_id(id)?).await.map_err(|e| e.to_string())?;
+    println!("resumed");
+    Ok(0)
+}
+
+pub async fn snapshot(id: &str) -> Result<i32, String> {
+    let dir = client()
+        .snapshot(&parse_id(id)?)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("snapshotted; state in {dir}");
+    Ok(0)
+}
+
+/// Stream the daemon's event bus as JSON lines.
 pub async fn events() -> Result<i32, String> {
-    let mut stream = agentos_client::open_stream("events.subscribe", json!(null)).await?;
-    while let Some(v) = stream.next().await? {
-        println!("{v}");
+    let mut sub = client().events().await.map_err(|e| e.to_string())?;
+    while let Some(event) = sub.next().await.map_err(|e| e.to_string())? {
+        println!("{}", serde_json::to_string(&event).unwrap_or_default());
     }
     Ok(0)
 }

@@ -54,6 +54,29 @@ The guest ships Python 3, Node.js, and git on a shared read-only rootfs, with a 
     --template github -- sh -c 'git log --oneline -1'
 ```
 
-Live CPU/memory/egress per sandbox stream over `agentos events` and the GUI monitor; the GUI also binds a global **⇧⌘K** panic kill switch.
+Live CPU/memory/egress per sandbox stream over `agentos events` and the GUI monitor; the GUI also binds a global **⇧⌘K** panic kill switch. `agentos pause|resume|snapshot|restore` freeze an agent mid-task or park its whole VM on disk and pick it up later.
+
+## Embedding
+
+[`agentos-client`](crates/agentos-client) is the API for running agents from your own program — the CLI and GUI are both built on it:
+
+```rust
+use agentos_client::{Client, RunEvent};
+use agentos_core::SandboxSpec;
+
+let spec = SandboxSpec::command(["python3", "agent.py"]); // no files, no network
+let mut run = Client::new().run(&spec).await?;
+while let Some(event) = run.next().await? {
+    if let RunEvent::Stdout(bytes) = event {
+        print!("{}", String::from_utf8_lossy(&bytes));
+    }
+}
+```
+
+`cargo run -p agentos-client --example embed -- python3 -c 'print(2**64)'`
+
+## Fleet policy
+
+A machine-wide policy file (`/etc/agentos/policy.json`, or `/Library/Application Support/AgentOS/policy.json`) caps what any sandbox may do — network ceiling, forbidden mount paths, resource limits — enforced by the daemon, not the client. `agentos policy` shows what's in force. See ARCHITECTURE.md §13 for what it does and doesn't guarantee.
 
 Status: **the full PRD feature set works** on macOS + Linux — hardware-isolated microVMs, deny-by-default mounts, NIC-less network policy, quotas + auto-kill, kill switch, GUI, agent runtimes + writable overlay, git integration, templates, and live CPU/RAM/network monitoring. The Linux Cloud Hypervisor backend is exercised by CI on KVM runners; Windows is a documented stub (WSL2 path in ARCHITECTURE.md §4). See ARCHITECTURE.md §11.

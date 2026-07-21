@@ -248,6 +248,41 @@ pub struct SandboxSpec {
     pub auto_kill: AutoKillRules,
 }
 
+impl SandboxSpec {
+    /// A deny-by-default sandbox running `command`: no host files, no network,
+    /// default resource limits. Grant capabilities by setting fields on the
+    /// result — nothing is implicit.
+    ///
+    /// ```
+    /// # use agentos_core::{SandboxSpec, NetPolicy};
+    /// let spec = SandboxSpec::command(["python3", "agent.py"]);
+    /// assert_eq!(spec.name, "python3");
+    /// assert!(spec.mounts.is_empty());
+    /// assert_eq!(spec.net, NetPolicy::Offline);
+    /// ```
+    pub fn command<I, S>(command: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let command: Vec<String> = command.into_iter().map(Into::into).collect();
+        let name = command
+            .first()
+            .map(|c| c.rsplit('/').next().unwrap_or(c).to_string())
+            .unwrap_or_else(|| "agent".to_string());
+        Self {
+            name,
+            command,
+            env: Vec::new(),
+            mounts: Vec::new(),
+            repo: None,
+            net: NetPolicy::Offline,
+            limits: ResourceLimits::default(),
+            auto_kill: AutoKillRules::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
