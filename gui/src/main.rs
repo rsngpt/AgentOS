@@ -147,6 +147,7 @@ async fn run_sandbox(
         env,
         mounts,
         repo,
+        template: template.clone().filter(|t| !t.is_empty()),
         net,
         limits: ResourceLimits {
             vcpus,
@@ -204,22 +205,18 @@ fn run_event_json(event: RunEvent) -> Value {
 /// Panic kill switch: terminate the most-recently-started running sandbox.
 /// Bound to a global hotkey so it works even when the window isn't focused.
 async fn kill_most_recent_running() -> Result<Value, String> {
-    let c = client();
-    let running = c
-        .list()
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .rev()
-        .find(|sb| matches!(sb.state, agentos_core::SandboxState::Running));
-    match running {
-        Some(sb) => c
-            .kill(&sb.id, false)
-            .await
-            .map(|_| json!({ "killed": true, "id": sb.id }))
-            .map_err(|e| e.to_string()),
+    match client().kill_newest_live().await.map_err(|e| e.to_string())? {
+        Some(id) => Ok(json!({ "killed": true, "id": id })),
         None => Ok(json!({ "killed": false, "reason": "no running sandbox" })),
     }
+}
+
+/// The same action the global hotkey fires, callable from the window. Gives
+/// the panic button a path that works even when the OS won't deliver the
+/// hotkey (unsigned build, accessibility permission not granted).
+#[tauri::command]
+async fn panic_kill() -> Result<Value, String> {
+    kill_most_recent_running().await
 }
 
 /// Forward the daemon's event bus to the frontend forever, reconnecting if
@@ -259,6 +256,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_sandboxes,
             kill_sandbox,
+            panic_kill,
             pause_sandbox,
             resume_sandbox,
             snapshot_sandbox,
@@ -267,11 +265,19 @@ fn main() {
         ])
         .setup(move |app| {
             use tauri_plugin_global_shortcut::GlobalShortcutExt;
-            // Registration can fail (e.g. macOS accessibility not granted);
-            // the in-window Terminate buttons still work regardless.
-            if let Err(e) = app.global_shortcut().register(panic_key) {
-                eprintln!("global kill hotkey unavailable: {e}");
-            }
+            // Registration can fail (macOS accessibility not granted, or the
+            // combo already taken). Tell the window rather than only stderr:
+            // a kill switch the user believes in but that never fires is worse
+            // than one they know is unavailable.
+            let status = match app.global_shortcut().register(panic_key) {
+                Ok(()) => json!({ "available": true }),
+                Err(e) => {
+                    eprintln!("global kill hotkey unavailable: {e}");
+                    json!({ "available": false, "error": e.to_string() })
+                }
+            };
+            app.handle().emit("hotkey-status", status).ok();
+
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(pump_events(handle));
             Ok(())

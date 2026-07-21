@@ -265,6 +265,29 @@ impl Client {
         Ok(v["dir"].as_str().unwrap_or_default().to_string())
     }
 
+    /// Panic button: terminate the most recently started sandbox that is still
+    /// live, returning which one (or `None` if nothing was running).
+    ///
+    /// This is the action behind a UI's "kill switch" — a user reaching for it
+    /// wants the thing they just launched dead, without first hunting for its
+    /// id. Lives here rather than in the GUI so it can be tested against a real
+    /// daemon, and so any embedder gets the same behaviour.
+    pub async fn kill_newest_live(&self) -> ClientResult<Option<SandboxId>> {
+        let newest = self
+            .list()
+            .await?
+            .into_iter()
+            .rev()
+            .find(|sb| matches!(sb.state, SandboxState::Running | SandboxState::Paused));
+        match newest {
+            Some(sb) => {
+                self.kill(&sb.id, false).await?;
+                Ok(Some(sb.id))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Subscribe to the daemon's event bus.
     pub async fn events(&self) -> ClientResult<EventSubscription> {
         Ok(EventSubscription {

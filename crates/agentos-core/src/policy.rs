@@ -232,6 +232,7 @@ mod tests {
             env: vec![],
             mounts: vec![],
             repo: None,
+            template: None,
             net: NetPolicy::Offline,
             limits: ResourceLimits::default(),
             auto_kill: Default::default(),

@@ -254,6 +254,32 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+echo "== panic kill switch: --newest, the GUI hotkey's own code path =="
+"$AGENTOS" run -- sleep 60 >/dev/null 2>&1 &
+panic_runner=$!
+sleep 4
+out=$("$AGENTOS" kill --newest 2>&1)
+wait "$panic_runner"
+check "panic kill terminates the newest live sandbox" "137" "$?"
+check "panic kill names what it killed" "yes" \
+    "$(echo "$out" | grep -q '^killed ' && echo yes || echo no)"
+"$AGENTOS" kill --newest >/dev/null 2>&1
+check "panic kill with nothing running exits nonzero" "1" "$?"
+
+# Toolchain variant: only if the opt-in image has been built.
+if [ -f "$HOME/.agentos/images/rootfs-devops.squashfs" ]; then
+    echo "== template devops: preloaded toolchains =="
+    out=$("$AGENTOS" run --template devops -- \
+        sh -c 'terraform version >/dev/null && aws --version >/dev/null && echo tools-ok' \
+        2>/dev/null | tail -1)
+    check "devops template ships terraform + aws cli" "tools-ok" "$out"
+else
+    echo "== template devops: skipped (rootfs-devops.squashfs not built) =="
+    out=$("$AGENTOS" run --template devops -- true 2>&1 | tail -1)
+    check "missing variant image explains how to build it" "yes" \
+        "$(echo "$out" | grep -q 'build-guest-image.sh --variant devops' && echo yes || echo no)"
+fi
+
 echo
 if [ "$FAILURES" -eq 0 ]; then
     echo "e2e: all tests passed"

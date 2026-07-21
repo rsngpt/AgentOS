@@ -85,7 +85,10 @@
 <header>
   <h1>Agent OS</h1>
   <span class="sub">hardware-isolated agent sandboxes</span>
-  <span class="sub">· kill switch ⇧⌘K</span>
+  <button id="panicBtn" class="killBtn" title="Terminate the newest running sandbox">
+    Kill switch ⇧⌘K
+  </button>
+  <span id="hotkeyWarn" class="sub" style="display:none; color:var(--warn)"></span>
   <span id="stats"></span>
 </header>
 <main>
@@ -299,10 +302,32 @@ listen("agentos-event", ({ payload: ev }) => {
   }
 });
 
-// ---- global panic hotkey (⇧⌘K) fired in the Rust layer ----
+// ---- panic kill switch ----
+// The button always works; the global hotkey additionally works when the
+// window isn't focused, if the OS lets us register it.
+$("panicBtn").addEventListener("click", async () => {
+  try {
+    const r = await invoke("panic_kill");
+    termAppend(r.killed ? `\n■ kill switch: terminated ${r.id}\n` : "\n■ nothing running\n", "err");
+  } catch (e) {
+    termAppend("\n■ kill switch failed: " + e + "\n", "err");
+  }
+  refresh();
+});
+
 listen("panic-kill", () => {
   termAppend("\n■ panic kill switch (⇧⌘K)\n", "err");
   refresh();
+});
+
+// Say so when the hotkey couldn't be registered — a kill switch you believe
+// in but that never fires is worse than one you know is unavailable.
+listen("hotkey-status", ({ payload }) => {
+  if (!payload.available) {
+    const w = $("hotkeyWarn");
+    w.textContent = "⇧⌘K unavailable — use the button (grant Accessibility to enable)";
+    w.style.display = "";
+  }
 });
 </script>
 </body>

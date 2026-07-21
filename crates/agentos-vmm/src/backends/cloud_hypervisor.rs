@@ -33,7 +33,7 @@ use tokio::process::{Child, Command};
 fn die_with_parent(cmd: &mut Command) {
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::process::CommandExt;
+        // tokio's Command has its own `pre_exec`; std's CommandExt isn't needed.
         unsafe {
             cmd.pre_exec(|| {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {

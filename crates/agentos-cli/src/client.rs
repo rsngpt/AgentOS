@@ -130,6 +130,21 @@ pub async fn kill(id: &str, save: bool) -> Result<i32, String> {
     Ok(0)
 }
 
+/// Panic kill: the newest live sandbox, wiped. Shares `kill_newest_live` with
+/// the GUI's global hotkey, so exercising this exercises that path too.
+pub async fn kill_newest() -> Result<i32, String> {
+    match client().kill_newest_live().await.map_err(|e| e.to_string())? {
+        Some(id) => {
+            println!("killed {id}");
+            Ok(0)
+        }
+        None => {
+            eprintln!("no running sandbox to kill");
+            Ok(1)
+        }
+    }
+}
+
 pub async fn pause(id: &str) -> Result<i32, String> {
     client().pause(&parse_id(id)?).await.map_err(|e| e.to_string())?;
     println!("paused");

@@ -15,8 +15,22 @@
 # `cargo build -p agentos-guest-agent --release --target <arch>-unknown-linux-musl`.
 #
 # Guest arch defaults to the host's; override with GUEST_ARCH=aarch64|x86_64.
+#
+# `--variant devops` builds an extra rootfs-devops.squashfs carrying the AWS
+# CLI and Terraform, which `agentos run --template devops` boots instead of the
+# base image. It's opt-in because the toolchain is large and most sandboxes
+# don't need it. Terraform comes from HashiCorp directly — Alpine dropped it
+# after the licence change, so it isn't in the package repos.
 set -eu
 cd "$(dirname "$0")/.."
+
+VARIANT=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --variant) VARIANT="${2:-}"; shift 2 ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
 
 MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine/latest-stable}"
 case "${GUEST_ARCH:-$(uname -m)}" in
@@ -139,6 +153,43 @@ mkdir -p "$ROOTFS/mnt" "$ROOTFS/proc" "$ROOTFS/sys" "$ROOTFS/dev" "$ROOTFS/etc"
 printf 'nameserver 127.0.0.1\n' > "$ROOTFS/etc/resolv.conf"
 mksquashfs "$ROOTFS" "$IMAGES/rootfs.squashfs.tmp" -noappend -quiet -comp xz
 mv "$IMAGES/rootfs.squashfs.tmp" "$IMAGES/rootfs.squashfs"
+
+# ---- Optional toolchain variant (PRD §7 one-click environments) ----
+if [ -n "$VARIANT" ]; then
+    case "$VARIANT" in
+        devops) EXTRA_PKGS="aws-cli"; WANT_TERRAFORM=yes ;;
+        *) echo "unknown variant: $VARIANT (known: devops)" >&2; exit 2 ;;
+    esac
+
+    VROOT="$WORK/rootfs-$VARIANT"
+    mkdir -p "$VROOT"
+    tar -xzf "$CACHE/minirootfs-$VER-$ARCH.tar.gz" -C "$VROOT"
+    # The variant is a superset of the base image, so a devops sandbox still
+    # has python3/node/git.
+    # shellcheck disable=SC2086
+    python3 scripts/apk-fetch.py "$MIRROR" "$ARCH" "$VROOT" \
+        python3 py3-pip nodejs npm git e2fsprogs $EXTRA_PKGS
+    mkdir -p "$VROOT/mnt" "$VROOT/proc" "$VROOT/sys" "$VROOT/dev" "$VROOT/etc"
+    printf 'nameserver 127.0.0.1\n' > "$VROOT/etc/resolv.conf"
+
+    if [ "${WANT_TERRAFORM:-no}" = yes ]; then
+        case "$ARCH" in
+            aarch64) TF_ARCH=arm64 ;;
+            x86_64)  TF_ARCH=amd64 ;;
+        esac
+        TF_VER=$(curl -fsSL https://checkpoint-api.hashicorp.com/v1/check/terraform \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_version"])')
+        echo "terraform $TF_VER ($TF_ARCH)"
+        fetch "https://releases.hashicorp.com/terraform/$TF_VER/terraform_${TF_VER}_linux_${TF_ARCH}.zip" \
+            "$CACHE/terraform-$TF_VER-$TF_ARCH.zip"
+        (cd "$VROOT/usr/bin" && unzip -oq "$CACHE/terraform-$TF_VER-$TF_ARCH.zip" terraform)
+        chmod 755 "$VROOT/usr/bin/terraform"
+    fi
+
+    mksquashfs "$VROOT" "$IMAGES/rootfs-$VARIANT.squashfs.tmp" -noappend -quiet -comp xz
+    mv "$IMAGES/rootfs-$VARIANT.squashfs.tmp" "$IMAGES/rootfs-$VARIANT.squashfs"
+    echo "variant $VARIANT: $(ls -lh "$IMAGES/rootfs-$VARIANT.squashfs" | awk '{print $5}')  $IMAGES/rootfs-$VARIANT.squashfs"
+fi
 
 echo "kernel:    $(ls -lh "$IMAGES/kernel" | awk '{print $5}')  $IMAGES/kernel"
 echo "initramfs: $(ls -lh "$IMAGES/initramfs.cpio.gz" | awk '{print $5}')  $IMAGES/initramfs.cpio.gz"

@@ -215,24 +215,70 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
     }
 }
 
-/// Named starter environments (PRD §7): each presets a network allowlist so
-/// the ecosystem's package tooling works without hand-writing `--net`. The
-/// runtimes themselves already ship in the guest rootfs.
-pub const TEMPLATES: &[(&str, &str)] = &[
-    ("python", "pypi.org, files.pythonhosted.org"),
-    ("node", "registry.npmjs.org"),
-    ("github", "github.com, *.github.com, codeload.github.com"),
+/// A named starter environment (PRD §7): a network allowlist for its
+/// ecosystem, and optionally a dedicated guest image with that ecosystem's
+/// toolchain baked in.
+pub struct Template {
+    pub name: &'static str,
+    /// Allowlist hosts the ecosystem's tooling needs.
+    pub hosts: &'static str,
+    /// When set, the sandbox boots `rootfs-<variant>.squashfs` instead of the
+    /// base image. Built opt-in by `scripts/build-guest-image.sh --variant`,
+    /// because a toolchain image is large and most sandboxes don't need one.
+    pub rootfs_variant: Option<&'static str>,
+    /// Shown by `agentos templates`.
+    pub description: &'static str,
+}
+
+/// Built-in templates. The base image already carries python3/pip, node/npm
+/// and git, so those templates only need a network allowlist; heavier
+/// toolchains get their own image.
+pub const TEMPLATES: &[Template] = &[
+    Template {
+        name: "python",
+        hosts: "pypi.org, files.pythonhosted.org",
+        rootfs_variant: None,
+        description: "Python 3 + pip (in the base image), PyPI reachable",
+    },
+    Template {
+        name: "node",
+        hosts: "registry.npmjs.org",
+        rootfs_variant: None,
+        description: "Node.js + npm (in the base image), npm registry reachable",
+    },
+    Template {
+        name: "github",
+        hosts: "github.com, *.github.com, codeload.github.com",
+        rootfs_variant: None,
+        description: "git (in the base image), GitHub reachable",
+    },
+    Template {
+        name: "devops",
+        hosts: "pypi.org, files.pythonhosted.org, *.amazonaws.com, \
+                registry.terraform.io, releases.hashicorp.com, checkpoint-api.hashicorp.com",
+        rootfs_variant: Some("devops"),
+        description: "AWS CLI + Terraform + Python — needs `build-guest-image.sh --variant devops`",
+    },
 ];
+
+fn template(name: &str) -> Result<&'static Template> {
+    TEMPLATES.iter().find(|t| t.name == name).ok_or_else(|| {
+        Error::InvalidSpec(format!(
+            "unknown template {name:?}; known: {}",
+            TEMPLATES.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")
+        ))
+    })
+}
 
 /// The [`NetPolicy`] for a named template, or an error listing valid names.
 pub fn template_net(name: &str) -> Result<NetPolicy> {
-    match TEMPLATES.iter().find(|(n, _)| *n == name) {
-        Some((_, hosts)) => NetPolicy::parse(&format!("allowlist:{hosts}")),
-        None => Err(Error::InvalidSpec(format!(
-            "unknown template {name:?}; known: {}",
-            TEMPLATES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
-        ))),
-    }
+    let t = template(name)?;
+    NetPolicy::parse(&format!("allowlist:{}", t.hosts))
+}
+
+/// The guest image variant a template needs, if it isn't the base image.
+pub fn template_rootfs_variant(name: &str) -> Result<Option<&'static str>> {
+    Ok(template(name)?.rootfs_variant)
 }
 
 /// The complete, user-approved grant for one sandbox.
@@ -250,6 +296,11 @@ pub struct SandboxSpec {
     /// Repo to clone host-side and mount at [`REPO_GUEST_PATH`].
     #[serde(default)]
     pub repo: Option<RepoSpec>,
+    /// Starter environment this sandbox was launched with. Clients resolve its
+    /// network allowlist; the daemon uses it to pick the guest image, so a
+    /// toolchain template boots the right rootfs.
+    #[serde(default)]
+    pub template: Option<String>,
     #[serde(default)]
     pub net: NetPolicy,
     #[serde(default)]
@@ -286,6 +337,7 @@ impl SandboxSpec {
             env: Vec::new(),
             mounts: Vec::new(),
             repo: None,
+            template: None,
             net: NetPolicy::Offline,
             limits: ResourceLimits::default(),
             auto_kill: AutoKillRules::default(),
@@ -339,6 +391,7 @@ mod tests {
                 url: "https://github.com/example/agent.git".into(),
                 git_ref: Some("main".into()),
             }),
+            template: Some("python".into()),
             net: NetPolicy::Allowlist(vec!["api.openai.com".into()]),
             limits: ResourceLimits::default(),
             auto_kill: AutoKillRules {

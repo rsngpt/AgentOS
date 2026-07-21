@@ -29,8 +29,13 @@ pub enum Command {
     Ps,
     /// The kill switch: terminate a sandbox immediately.
     Kill {
-        /// Sandbox id (from `agentos ps`).
-        id: String,
+        /// Sandbox id (from `agentos ps`). Omit it with --newest.
+        #[arg(required_unless_present = "newest")]
+        id: Option<String>,
+        /// Panic button: kill the most recently started live sandbox. Same
+        /// action the GUI's ⇧⌘K hotkey fires, so it can be tested headlessly.
+        #[arg(long, conflicts_with_all = ["id", "save"])]
+        newest: bool,
         /// Keep the overlay disk for debugging instead of wiping it.
         #[arg(long)]
         save: bool,
@@ -173,6 +178,7 @@ impl RunArgs {
             env,
             mounts,
             repo,
+            template: self.template.clone(),
             net,
             limits: ResourceLimits {
                 vcpus: self.vcpus,

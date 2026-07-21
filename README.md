@@ -53,9 +53,13 @@ The guest ships Python 3, Node.js, and git on a shared read-only rootfs, with a 
 # clone a repo host-side (with your creds, no SSH keys in the guest) into /workspace
 ./target/debug/agentos run --repo https://github.com/octocat/Hello-World.git \
     --template github -- sh -c 'git log --oneline -1'
+
+# a template can also boot a heavier toolchain image, built opt-in:
+./scripts/build-guest-image.sh --variant devops
+./target/debug/agentos run --template devops -- terraform version
 ```
 
-Live CPU/memory/egress per sandbox stream over `agentos events` and the GUI monitor; the GUI also binds a global **⇧⌘K** panic kill switch. `agentos pause|resume|snapshot|restore` freeze an agent mid-task or park its whole VM on disk and pick it up later.
+Live CPU/memory/egress per sandbox stream over `agentos events` and the GUI monitor. The panic kill switch has three faces backed by one call: the GUI's global **⇧⌘K**, its red button, and `agentos kill --newest`. `agentos pause|resume|snapshot|restore` freeze an agent mid-task or park its whole VM on disk and pick it up later.
 
 ## Embedding
 

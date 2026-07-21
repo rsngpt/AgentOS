@@ -302,7 +302,26 @@ async fn drive(
     // Runtime rootfs (shared, read-only) + a fresh per-sandbox writable overlay
     // disk sized to the disk quota. Optional: without the rootfs image the guest
     // falls back to the initramfs (busybox only, no persistence).
-    let rootfs = images.join("rootfs.squashfs");
+    // A toolchain template boots its own image; the base one otherwise.
+    let rootfs = match spec
+        .template
+        .as_deref()
+        .map(agentos_core::spec::template_rootfs_variant)
+        .transpose()?
+        .flatten()
+    {
+        Some(variant) => {
+            let path = images.join(format!("rootfs-{variant}.squashfs"));
+            if !path.exists() {
+                return Err(Error::InvalidSpec(format!(
+                    "template needs the '{variant}' guest image, which isn't built: \
+                     run scripts/build-guest-image.sh --variant {variant}"
+                )));
+            }
+            path
+        }
+        None => images.join("rootfs.squashfs"),
+    };
     let (rootfs, overlay) = if rootfs.exists() {
         let overlay = sandbox_dir.join("overlay.img");
         if !restoring {

@@ -21,7 +21,11 @@ async fn main() {
             Err(e) => Err(e.to_string()),
         },
         Command::Ps => client::list().await,
-        Command::Kill { id, save } => client::kill(&id, save).await,
+        Command::Kill { id, newest, save } => match id {
+            Some(id) => client::kill(&id, save).await,
+            None if newest => client::kill_newest().await,
+            None => unreachable!("clap requires an id unless --newest"),
+        },
         Command::Pause { id } => client::pause(&id).await,
         Command::Resume { id } => client::resume(&id).await,
         Command::Snapshot { id } => client::snapshot(&id).await,

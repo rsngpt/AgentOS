@@ -724,11 +724,10 @@ mod linux {
     fn cpu_percent_between(prev: (u64, u64), now: (u64, u64)) -> u32 {
         let busy = now.0.saturating_sub(prev.0);
         let total = now.1.saturating_sub(prev.1);
-        if total == 0 {
-            0
-        } else {
-            ((busy * 100) / total).min(100) as u32
-        }
+        // No jiffies elapsed between samples => nothing to report.
+        (busy * 100)
+            .checked_div(total)
+            .map_or(0, |pct| pct.min(100) as u32)
     }
 
     /// Read a child output stream and emit protocol frames.
