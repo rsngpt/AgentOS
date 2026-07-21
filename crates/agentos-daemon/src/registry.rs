@@ -67,6 +67,16 @@ impl Registry {
         id
     }
 
+    /// Re-register a sandbox that was snapshotted before this daemon started.
+    /// It has no VM until `restore` boots one.
+    pub async fn insert_snapshotted(&self, id: SandboxId, spec: SandboxSpec) {
+        self.inner.lock().await.entry(id).or_insert(Sandbox {
+            spec,
+            state: SandboxState::Snapshotted,
+            handle: None,
+        });
+    }
+
     pub async fn set_handle(&self, id: &SandboxId, handle: SharedHandle) {
         if let Some(sb) = self.inner.lock().await.get_mut(id) {
             sb.handle = Some(handle);

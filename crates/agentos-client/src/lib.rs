@@ -33,6 +33,9 @@
 use agentos_core::event::Event;
 use agentos_core::{SandboxId, SandboxSpec, SandboxState};
 use serde::Deserialize;
+use serde_json::{json, Value};
+
+use tokio::net::unix::OwnedWriteHalf;
 
 /// Anything that can go wrong talking to the daemon.
 #[derive(Debug, thiserror::Error)]
@@ -86,12 +89,52 @@ pub enum RunEvent {
     Unknown(serde_json::Value),
 }
 
+/// Writes to the sandbox command's standard input.
+///
+/// Taken once from a [`RunStream`] so it can be moved into its own task —
+/// an interactive agent needs stdin flowing *while* output streams back.
+pub struct StdinSender {
+    write: OwnedWriteHalf,
+}
+
+impl StdinSender {
+    /// Feed bytes to the command's stdin.
+    pub async fn send(&mut self, data: &[u8]) -> ClientResult<()> {
+        self.write_line(&json!({ "stdin": data })).await
+    }
+
+    /// Close stdin, so a command reading to EOF (`cat`, `sort`) finishes.
+    pub async fn close(&mut self) -> ClientResult<()> {
+        self.write_line(&json!({ "stdin": Value::Null })).await
+    }
+
+    async fn write_line(&mut self, v: &Value) -> ClientResult<()> {
+        let mut line = serde_json::to_vec(v)
+            .map_err(|e| Error::Protocol(format!("encoding stdin: {e}")))?;
+        line.push(b'\n');
+        self.write
+            .write_all(&line)
+            .await
+            .map_err(|e| Error::Protocol(format!("writing stdin: {e}")))?;
+        self.write
+            .flush()
+            .await
+            .map_err(|e| Error::Protocol(format!("flushing stdin: {e}")))
+    }
+}
+
 /// The event stream of one `run` or `restore`.
 pub struct RunStream {
     inner: EventStream,
 }
 
 impl RunStream {
+    /// Take the handle for writing to the command's stdin. Returns `None` on
+    /// the second call — there is only one stdin.
+    pub fn stdin(&mut self) -> Option<StdinSender> {
+        self.inner.write.take().map(|write| StdinSender { write })
+    }
+
     /// Next event, or `None` when the sandbox is finished.
     pub async fn next(&mut self) -> ClientResult<Option<RunEvent>> {
         let Some(v) = self.inner.next().await.map_err(Error::Protocol)? else {
@@ -247,9 +290,8 @@ impl Client {
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 
 fn socket_path() -> PathBuf {
@@ -365,9 +407,9 @@ pub async fn unary(method: &str, params: Value) -> Result<Value, String> {
 /// A dedicated streaming connection; `next()` yields one JSON value per line.
 pub struct EventStream {
     lines: Lines<BufReader<OwnedReadHalf>>,
-    // Keep the write half open: dropping it would half-close the socket and
-    // some daemons treat that as client-gone.
-    _write: OwnedWriteHalf,
+    // The write half stays open for the life of the stream: it carries stdin
+    // for a run, and closing it early would look like the client went away.
+    write: Option<OwnedWriteHalf>,
 }
 
 impl EventStream {
@@ -388,6 +430,6 @@ pub async fn open_stream(method: &str, params: Value) -> Result<EventStream, Str
     let (read, write) = stream.into_split();
     Ok(EventStream {
         lines: BufReader::new(read).lines(),
-        _write: write,
+        write: Some(write),
     })
 }

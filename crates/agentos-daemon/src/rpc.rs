@@ -43,7 +43,8 @@ pub async fn serve_connection(
         if req.method == "sandbox.run" {
             match serde_json::from_value::<SandboxSpec>(req.params) {
                 Ok(spec) => {
-                    run::run_sandbox(registry.clone(), spec, &mut write).await?;
+                    // The rest of this connection carries the command's stdin.
+                    run::run_sandbox(registry.clone(), spec, lines, &mut write).await?;
                 }
                 Err(e) => {
                     respond(&mut write, req.id, Err(format!("invalid SandboxSpec: {e}"))).await?;
@@ -58,7 +59,7 @@ pub async fn serve_connection(
                 id: SandboxId,
             }
             match serde_json::from_value::<IdParam>(req.params) {
-                Ok(p) => run::restore_sandbox(registry.clone(), p.id, &mut write).await?,
+                Ok(p) => run::restore_sandbox(registry.clone(), p.id, lines, &mut write).await?,
                 Err(e) => {
                     respond(&mut write, req.id, Err(format!("invalid params: {e}"))).await?;
                 }

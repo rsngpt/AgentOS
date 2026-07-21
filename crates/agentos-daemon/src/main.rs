@@ -42,6 +42,9 @@ async fn main() -> anyhow_lite::Result<()> {
     info!(socket = %sock_path.display(), "agentosd listening");
 
     let registry = registry::Registry::new();
+    // Snapshots outlive this process; pick up any left on disk so `ps` lists
+    // them and `restore` works after a daemon restart.
+    run::rehydrate_snapshots(&registry).await;
 
     loop {
         let (stream, _) = listener.accept().await?;

@@ -33,6 +33,16 @@ impl fmt::Display for SandboxId {
     }
 }
 
+impl std::str::FromStr for SandboxId {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        s.parse::<uuid::Uuid>()
+            .map(Self)
+            .map_err(|_| Error::InvalidSpec(format!("not a sandbox id: {s}")))
+    }
+}
+
 /// Access mode for a host directory mounted into the guest.
 ///
 /// Read-only is enforced host-side (the virtio-fs share is opened RO); the

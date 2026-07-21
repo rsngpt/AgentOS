@@ -76,11 +76,61 @@ pub fn state_path(sandbox_dir: &std::path::Path) -> PathBuf {
     sandbox_dir.join("vmstate")
 }
 
+/// The spec a snapshot needs to be restored with — written beside the state so
+/// a restore survives the daemon exiting, which the in-memory registry can't.
+fn spec_path(sandbox_dir: &std::path::Path) -> PathBuf {
+    sandbox_dir.join("spec.json")
+}
+
+/// Re-register sandboxes that were snapshotted before the daemon stopped.
+///
+/// Without this the state file and overlay would still be on disk but the spec
+/// needed to boot them would be gone, so `agentos restore` would report an
+/// unknown sandbox — which defeats the point of parking work to come back to.
+pub async fn rehydrate_snapshots(registry: &Registry) {
+    let dir = agentos_home().join("sandboxes");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut found = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !state_path(&path).exists() {
+            continue; // not a snapshot
+        }
+        let Ok(text) = std::fs::read_to_string(spec_path(&path)) else {
+            continue;
+        };
+        let Ok(spec) = serde_json::from_str::<SandboxSpec>(&text) else {
+            tracing::warn!(dir = %path.display(), "snapshot has an unreadable spec.json");
+            continue;
+        };
+        let Some(id) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| s.parse::<agentos_core::SandboxId>().ok())
+        else {
+            continue;
+        };
+        registry.insert_snapshotted(id, spec).await;
+        found += 1;
+    }
+    if found > 0 {
+        info!(count = found, "recovered snapshotted sandboxes from disk");
+    }
+}
+
 /// Bring a snapshotted sandbox back and stream it to `client`, picking the
 /// command up mid-execution.
+/// The remainder of a run connection, which carries the command's stdin as
+/// `{"stdin": [bytes]}` lines (`null` closes it).
+pub type ClientInput =
+    tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>;
+
 pub async fn restore_sandbox(
     registry: Registry,
     id: agentos_core::SandboxId,
+    client_in: ClientInput,
     client: &mut (impl AsyncWrite + Unpin),
 ) -> std::io::Result<()> {
     let Some(spec) = registry.spec(&id).await else {
@@ -93,7 +143,7 @@ pub async fn restore_sandbox(
     let sandbox_dir = agentos_home().join("sandboxes").join(id.to_string());
     emit(client, json!({ "event": "restoring", "id": id })).await?;
 
-    match drive(&registry, &id, spec, client, Some(state_path(&sandbox_dir))).await {
+    match drive(&registry, &id, spec, client_in, client, Some(state_path(&sandbox_dir))).await {
         Ok(()) => Ok(()),
         Err(e) => {
             tracing::warn!(%id, error = %e, "restore failed");
@@ -106,6 +156,7 @@ pub async fn restore_sandbox(
 pub async fn run_sandbox(
     registry: Registry,
     spec: SandboxSpec,
+    client_in: ClientInput,
     client: &mut (impl AsyncWrite + Unpin),
 ) -> std::io::Result<()> {
     // Fleet policy is applied *here*, in the daemon, not in any client: a user
@@ -123,7 +174,7 @@ pub async fn run_sandbox(
     let id = registry.create(spec.clone()).await;
     emit(client, json!({ "event": "created", "id": id })).await?;
 
-    match drive(&registry, &id, spec, client, None).await {
+    match drive(&registry, &id, spec, client_in, client, None).await {
         Ok(()) => Ok(()),
         Err(e) => {
             tracing::warn!(%id, error = %e, "sandbox run failed");
@@ -200,6 +251,7 @@ async fn drive(
     registry: &Registry,
     id: &agentos_core::SandboxId,
     mut spec: SandboxSpec,
+    client_in: ClientInput,
     client: &mut (impl AsyncWrite + Unpin),
     restore_from: Option<PathBuf>,
 ) -> Result<()> {
@@ -222,6 +274,11 @@ async fn drive(
 
     let sandbox_dir = home.join("sandboxes").join(id.to_string());
     std::fs::create_dir_all(&sandbox_dir)?;
+    // Persist the (policy-applied, canonicalised) spec next to the sandbox so a
+    // snapshot can be restored even after the daemon restarts.
+    if let Ok(json) = serde_json::to_vec_pretty(&spec) {
+        std::fs::write(spec_path(&sandbox_dir), json).ok();
+    }
 
     // Git repo: clone host-side (with the host's git + credentials), then mount
     // the working tree RW at /workspace. Keys/tokens never enter the guest.
@@ -305,15 +362,18 @@ async fn drive(
     };
     registry.set_state(id, SandboxState::Booting).await;
 
-    let mut stream = handle.connect_vsock(GUEST_CONTROL_PORT).await?;
+    let stream = handle.connect_vsock(GUEST_CONTROL_PORT).await?;
+    // Split so stdin can flow to the guest *while* output streams back — an
+    // interactive agent needs both directions live at once.
+    let (mut vsock_r, mut vsock_w) = tokio::io::split(stream);
     let shared = Arc::new(Mutex::new(handle));
     registry.set_handle(id, shared.clone()).await;
 
     // Handshake (bounded: a wedged boot must not hang the client forever).
     let hello = async {
-        frames::write_host_frame(&mut stream, &HostMessage::Hello { version: PROTOCOL_VERSION })
+        frames::write_host_frame(&mut vsock_w, &HostMessage::Hello { version: PROTOCOL_VERSION })
             .await?;
-        frames::read_guest_frame(&mut stream).await
+        frames::read_guest_frame(&mut vsock_r).await
     };
     // `running` means the guest already has a command going — we're
     // reattaching to a restored VM and must not issue a second Exec.
@@ -358,7 +418,7 @@ async fn drive(
         info!(%id, "reattached to a command already running in the guest");
     } else {
         frames::write_host_frame(
-            &mut stream,
+            &mut vsock_w,
             &HostMessage::Exec {
                 command: spec.command.clone(),
                 env: spec.env.clone(),
@@ -373,6 +433,35 @@ async fn drive(
     emit(client, json!({ "event": "running" }))
         .await
         .map_err(Error::Io)?;
+
+    // Pump the client's stdin to the guest for the life of the run. This is
+    // what makes interactive agents (a REPL, anything that prompts) usable —
+    // it has to run concurrently with the output loop below.
+    let stdin_task = tokio::spawn(async move {
+        let mut lines = client_in;
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(field) = v.get("stdin") else { continue };
+            // An explicit null (or the client hanging up) closes stdin, so a
+            // command reading to EOF finishes instead of hanging.
+            let data: Vec<u8> = field
+                .as_array()
+                .map(|a| a.iter().filter_map(|b| b.as_u64().map(|b| b as u8)).collect())
+                .unwrap_or_default();
+            if frames::write_host_frame(&mut vsock_w, &HostMessage::Stdin { data })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        // Client gone: signal EOF to the guest.
+        frames::write_host_frame(&mut vsock_w, &HostMessage::Stdin { data: Vec::new() })
+            .await
+            .ok();
+    });
 
     // Auto-kill monitor: samples guest CPU/memory (from Metrics frames below),
     // proxy egress bytes, and wall-clock runtime.
@@ -389,7 +478,7 @@ async fn drive(
 
     // Stream until Exited or EOF.
     let mut exit_info = None;
-    while let Some(msg) = frames::read_guest_frame(&mut stream).await? {
+    while let Some(msg) = frames::read_guest_frame(&mut vsock_r).await? {
         match msg {
             GuestMessage::Stdout { data } => {
                 emit(client, json!({ "event": "stdout", "data": data }))
@@ -413,6 +502,7 @@ async fn drive(
         }
     }
     monitor_task.abort();
+    stdin_task.abort();
 
     // Reap the VMM child (guest powers off after Exited; EOF means it died
     // or was killed).

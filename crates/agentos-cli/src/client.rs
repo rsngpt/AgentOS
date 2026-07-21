@@ -32,6 +32,30 @@ pub async fn restore(id: &str) -> Result<i32, String> {
 }
 
 async fn stream_run(mut stream: agentos_client::RunStream) -> Result<i32, String> {
+    // Forward our stdin to the sandbox so interactive agents work. Runs
+    // concurrently with the output loop, and is aborted when the run ends so
+    // a blocked read on a terminal doesn't keep the process alive.
+    let stdin_task = stream.stdin().map(|mut sender| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut input = tokio::io::stdin();
+            let mut buf = [0u8; 8192];
+            loop {
+                match input.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sender.send(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            // Our stdin hit EOF: close the guest's too, so `cat`-style
+            // commands finish instead of waiting forever.
+            sender.close().await.ok();
+        })
+    });
+
     let mut stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
     loop {
@@ -52,16 +76,27 @@ async fn stream_run(mut stream: agentos_client::RunStream) -> Result<i32, String
                 stderr.write_all(&data).map_err(|e| e.to_string())?;
                 stderr.flush().ok();
             }
-            RunEvent::Exited { code, .. } => return Ok(code.unwrap_or(1)),
+            RunEvent::Exited { code, .. } => {
+                if let Some(t) = &stdin_task {
+                    t.abort();
+                }
+                return Ok(code.unwrap_or(1));
+            }
             RunEvent::Terminated { reason, saved_dir } => {
                 eprintln!("sandbox terminated ({reason})");
                 if let Some(dir) = saved_dir {
                     eprintln!("sandbox state saved at {dir}");
                 }
+                if let Some(t) = &stdin_task {
+                    t.abort();
+                }
                 return Ok(137);
             }
             RunEvent::Snapshotted { dir } => {
                 eprintln!("sandbox snapshotted; state in {dir}");
+                if let Some(t) = &stdin_task {
+                    t.abort();
+                }
                 return Ok(0);
             }
         }

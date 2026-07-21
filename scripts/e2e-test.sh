@@ -51,6 +51,12 @@ ro-blocked" ] || { echo "  mount run stderr was:" >&2; sed 's/^/  /' /tmp/agento
 check "rw mount round-trips to host" "guest" "$(cat "$M/rw/out.txt" 2>/dev/null)"
 rm -rf "$M"
 
+echo "== stdin: interactive agents can be driven (PRD Flow 1) =="
+check "stdin reaches the command" "hello" "$(printf 'hello\n' | "$AGENTOS" run -- cat 2>/dev/null)"
+# `sort` only finishes if EOF propagates; a hang here means stdin never closes.
+check "stdin EOF propagates" "a
+b" "$(printf 'b\na\n' | "$AGENTOS" run -- sort 2>/dev/null)"
+
 echo "== runtimes: python3, node, git present in the guest rootfs =="
 out=$("$AGENTOS" run -- sh -c 'command -v python3 >/dev/null && command -v node >/dev/null && command -v git >/dev/null && echo runtimes-ok || echo missing' 2>/dev/null)
 check "python3+node+git available" "runtimes-ok" "$out"
@@ -121,7 +127,7 @@ snapper=$!
 sleep 7
 id=$("$AGENTOS" ps | awk '$3=="running"{print $1; exit}')
 if [ -n "$id" ]; then
-    last_before=$(grep -c '^s' /tmp/agentos-e2e-snap.txt)
+    last_before=$(grep -cE '^s[0-9]+$' /tmp/agentos-e2e-snap.txt)
     "$AGENTOS" snapshot "$id" >/dev/null 2>&1
     check "state is snapshotted" "snapshotted" "$("$AGENTOS" ps | awk -v i="$id" '$1==i{print $3}')"
     wait "$snapper" 2>/dev/null
@@ -132,8 +138,8 @@ if [ -n "$id" ]; then
     # it stopped (a line buffered at snapshot time may be replayed, which is
     # correct — no output is lost) and runs on past that point. What must NOT
     # happen is re-running the command from scratch at s0.
-    first_after=$(grep '^s' /tmp/agentos-e2e-restored.txt | head -1 | tr -d 's')
-    last_after=$(grep '^s' /tmp/agentos-e2e-restored.txt | tail -1 | tr -d 's')
+    first_after=$(grep -E '^s[0-9]+$' /tmp/agentos-e2e-restored.txt | head -1 | tr -d 's')
+    last_after=$(grep -E '^s[0-9]+$' /tmp/agentos-e2e-restored.txt | tail -1 | tr -d 's')
     if [ -n "$first_after" ] && [ "$first_after" -gt 0 ] \
         && [ -n "$last_after" ] && [ "$last_after" -ge "$last_before" ]; then
         echo "PASS: restored guest resumed at s$first_after and ran to s$last_after (snapshot after s$((last_before - 1)))"
@@ -146,6 +152,37 @@ if [ -n "$id" ]; then
 else
     echo "FAIL: snapshot/restore — no running sandbox found" >&2
     kill "$snapper" 2>/dev/null
+    FAILURES=$((FAILURES + 1))
+fi
+
+echo "== snapshots survive a daemon restart =="
+"$AGENTOS" run -- sh -c 'i=0; while [ $i -lt 120 ]; do echo "r$i"; i=$((i+1)); sleep 1; done' \
+    > /tmp/agentos-e2e-persist.txt 2>&1 &
+persister=$!
+sleep 7
+id=$("$AGENTOS" ps | awk '$3=="running"{print $1; exit}')
+if [ -n "$id" ]; then
+    "$AGENTOS" snapshot "$id" >/dev/null 2>&1
+    wait "$persister" 2>/dev/null
+    # Kill the daemon outright: the spec now lives on disk, not just in RAM.
+    pkill -f "$(basename "$AGENTOS")d" 2>/dev/null; sleep 2
+    check "snapshot is still listed after the daemon restarts" "snapshotted" \
+        "$("$AGENTOS" ps | awk -v i="$id" '$1==i{print $3}')"
+    "$AGENTOS" restore "$id" > /tmp/agentos-e2e-persist2.txt 2>&1 &
+    restorer2=$!
+    sleep 10
+    first=$(grep -E '^r[0-9]+$' /tmp/agentos-e2e-persist2.txt | head -1 | tr -d 'r')
+    if [ -n "$first" ] && [ "$first" -gt 0 ]; then
+        echo "PASS: restored mid-execution (at r$first) after a daemon restart"
+    else
+        echo "FAIL: could not restore after daemon restart (first=${first:-none})" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+    "$AGENTOS" kill "$id" >/dev/null 2>&1
+    wait "$restorer2" 2>/dev/null
+else
+    echo "FAIL: snapshot persistence — no running sandbox found" >&2
+    kill "$persister" 2>/dev/null
     FAILURES=$((FAILURES + 1))
 fi
 
