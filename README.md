@@ -28,6 +28,7 @@ cargo build -p agentos-guest-agent --release --target aarch64-unknown-linux-musl
 ./scripts/build-guest-image.sh     # Alpine kernel + initramfs -> ~/.agentos/images
 
 ./target/debug/agentos run -- echo hi          # boots a real microVM (~1s)
+./target/debug/agentos start -- echo hi        # `start` is an alias
 ./target/debug/agentos run \
     --mount ./project:rw --mount /data/corpus \
     --net allowlist:api.openai.com \

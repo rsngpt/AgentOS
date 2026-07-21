@@ -43,6 +43,50 @@ async fn kill_sandbox(id: String, save: bool) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Lifecycle controls, so the GUI can do what the CLI can.
+#[tauri::command]
+async fn pause_sandbox(id: String) -> Result<Value, String> {
+    client()
+        .pause(&parse_id(&id)?)
+        .await
+        .map(|_| json!({ "paused": true }))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn resume_sandbox(id: String) -> Result<Value, String> {
+    client()
+        .resume(&parse_id(&id)?)
+        .await
+        .map(|_| json!({ "resumed": true }))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn snapshot_sandbox(id: String) -> Result<Value, String> {
+    client()
+        .snapshot(&parse_id(&id)?)
+        .await
+        .map(|dir| json!({ "dir": dir }))
+        .map_err(|e| e.to_string())
+}
+
+/// Restore streams like a run, so it reuses the same `run-line` channel.
+#[tauri::command]
+async fn restore_sandbox(app: AppHandle, id: String) -> Result<(), String> {
+    let mut stream = client()
+        .restore(&parse_id(&id)?)
+        .await
+        .map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn(async move {
+        while let Ok(Some(event)) = stream.next().await {
+            app.emit("run-line", run_event_json(event)).ok();
+        }
+        app.emit("run-line", json!({ "event": "stream_closed" })).ok();
+    });
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn run_sandbox(
@@ -50,6 +94,9 @@ async fn run_sandbox(
     command: String,
     mounts: Vec<String>,
     net: String,
+    template: Option<String>,
+    repo: Option<String>,
+    env: Vec<String>,
     vcpus: u8,
     mem_mib: u32,
     kill_over_mem: Option<u32>,
@@ -66,13 +113,40 @@ async fn run_sandbox(
         .map(|m| MountSpec::parse(m.trim()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    let net = NetPolicy::parse(&net).map_err(|e| e.to_string())?;
+    // A template presets the allowlist; an explicit non-default --net wins,
+    // matching the CLI's precedence exactly.
+    let net = match template.as_deref().filter(|t| !t.is_empty()) {
+        Some(t) if net == "offline" => {
+            agentos_core::template_net(t).map_err(|e| e.to_string())?
+        }
+        Some(t) => {
+            agentos_core::template_net(t).map_err(|e| e.to_string())?;
+            NetPolicy::parse(&net).map_err(|e| e.to_string())?
+        }
+        None => NetPolicy::parse(&net).map_err(|e| e.to_string())?,
+    };
+    let env = env
+        .iter()
+        .filter(|kv| !kv.trim().is_empty())
+        .map(|kv| {
+            kv.split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.to_string()))
+                .ok_or_else(|| format!("env expects KEY=VALUE, got {kv:?}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let repo = repo
+        .filter(|r| !r.trim().is_empty())
+        .map(|url| agentos_core::RepoSpec {
+            url: url.trim().to_string(),
+            git_ref: None,
+        });
+
     let spec = SandboxSpec {
         name: argv[0].rsplit('/').next().unwrap_or("agent").to_string(),
         command: argv,
-        env: vec![],
+        env,
         mounts,
-        repo: None,
+        repo,
         net,
         limits: ResourceLimits {
             vcpus,
@@ -185,6 +259,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_sandboxes,
             kill_sandbox,
+            pause_sandbox,
+            resume_sandbox,
+            snapshot_sandbox,
+            restore_sandbox,
             run_sandbox
         ])
         .setup(move |app| {

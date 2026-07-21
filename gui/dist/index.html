@@ -100,6 +100,23 @@
       <textarea id="mounts" rows="3" placeholder="./project:rw&#10;/data/corpus"></textarea>
     </div>
     <div>
+      <label>Git repo — cloned host-side, mounted at /workspace</label>
+      <input id="repo" placeholder="https://github.com/owner/name.git">
+    </div>
+    <div>
+      <label>Template — presets the ecosystem's allowlist</label>
+      <select id="template">
+        <option value="" selected>none</option>
+        <option value="python">python (pypi)</option>
+        <option value="node">node (npm)</option>
+        <option value="github">github</option>
+      </select>
+    </div>
+    <div>
+      <label>Environment — one KEY=VALUE per line</label>
+      <textarea id="env" rows="2" placeholder="OPENAI_API_KEY=sk-..."></textarea>
+    </div>
+    <div>
       <label>Network</label>
       <select id="netmode">
         <option value="offline" selected>offline — no network at all</option>
@@ -178,6 +195,9 @@ $("runBtn").addEventListener("click", async () => {
       command: $("cmd").value,
       mounts: $("mounts").value.split("\n"),
       net,
+      template: $("template").value || null,
+      repo: $("repo").value || null,
+      env: $("env").value.split("\n"),
       vcpus: Number($("vcpus").value),
       memMib: Number($("mem").value),
       killOverMem: optNum("akMem"),
@@ -220,14 +240,34 @@ async function refresh() {
       tr.innerHTML =
         `<td class="id">${sb.id.slice(0, 8)}</td><td>${sb.name}</td>` +
         `<td><span class="state ${st}">${st}</span></td><td style="text-align:right"></td>`;
-      if (st === "running" || st === "booting" || st === "provisioning") {
-        const kill = document.createElement("button");
-        kill.className = "killBtn"; kill.textContent = "Terminate";
-        kill.onclick = () => invoke("kill_sandbox", { id: sb.id, save: false }).catch(alert);
-        const save = document.createElement("button");
-        save.className = "saveBtn"; save.textContent = "kill+save";
-        save.onclick = () => invoke("kill_sandbox", { id: sb.id, save: true }).catch(alert);
-        tr.lastChild.append(save, document.createTextNode(" "), kill);
+      // Lifecycle controls, matching what the CLI can do.
+      const btn = (label, cls, fn) => {
+        const b = document.createElement("button");
+        b.className = cls; b.textContent = label;
+        b.onclick = () => fn().catch(alert);
+        return b;
+      };
+      const cell = tr.lastChild;
+      const spacer = () => document.createTextNode(" ");
+      if (st === "running") {
+        cell.append(
+          btn("pause", "saveBtn", () => invoke("pause_sandbox", { id: sb.id })), spacer(),
+          btn("snapshot", "saveBtn", () => invoke("snapshot_sandbox", { id: sb.id })), spacer(),
+        );
+      } else if (st === "paused") {
+        cell.append(
+          btn("resume", "saveBtn", () => invoke("resume_sandbox", { id: sb.id })), spacer(),
+          btn("snapshot", "saveBtn", () => invoke("snapshot_sandbox", { id: sb.id })), spacer(),
+        );
+      } else if (st === "snapshotted") {
+        cell.append(btn("restore", "saveBtn", () => invoke("restore_sandbox", { id: sb.id })));
+      }
+      if (st === "running" || st === "paused" || st === "booting" || st === "provisioning") {
+        cell.append(
+          btn("kill+save", "saveBtn", () => invoke("kill_sandbox", { id: sb.id, save: true })),
+          spacer(),
+          btn("Terminate", "killBtn", () => invoke("kill_sandbox", { id: sb.id, save: false })),
+        );
       }
       rows.appendChild(tr);
     }
@@ -253,7 +293,7 @@ listen("agentos-event", ({ payload: ev }) => {
     while (rows.children.length > 200) rows.lastChild.remove();
   } else if (k.kind === "resource_sample") {
     $("stats").textContent =
-      `${ev.sandbox.slice(0, 8)}  cpu ${k.cpu_percent}% · mem ${k.mem_mib} MiB · egress ${(k.egress_total_bytes / 1048576).toFixed(1)} MiB`;
+      `${ev.sandbox.slice(0, 8)}  cpu ${k.cpu_percent}% · mem ${k.mem_mib} MiB · disk ${k.disk_used_mib ?? 0} MiB · egress ${(k.egress_total_bytes / 1048576).toFixed(1)} MiB`;
   } else if (k.kind === "state_changed") {
     refresh();
   }
