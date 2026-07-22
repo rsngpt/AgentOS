@@ -59,7 +59,27 @@ The guest ships Python 3, Node.js, and git on a shared read-only rootfs, with a 
 ./target/debug/agentos run --template devops -- terraform version
 ```
 
-Live CPU/memory/egress per sandbox stream over `agentos events` and the GUI monitor. The panic kill switch has three faces backed by one call: the GUI's global **⇧⌘K**, its red button, and `agentos kill --newest`. `agentos pause|resume|snapshot|restore` freeze an agent mid-task or park its whole VM on disk and pick it up later.
+`agentos pause|resume|snapshot|restore` freeze an agent mid-task or park its whole VM on disk and pick it up later. Live CPU/memory/egress per sandbox stream over `agentos events` and the GUI monitor. The panic kill switch has three faces backed by one call: the GUI's global **⇧⌘K**, its red button, and `agentos kill --newest`.
+
+Grants can be changed on an agent that is **already running** — the network policy lives host-side, so revoking it binds the agent's next connection:
+
+```sh
+agentos permissions <id> --net offline          # cut it off mid-task
+agentos permissions <id> --kill-after-secs 60   # add a deadline
+```
+
+Mounts are the exception and the daemon says so rather than pretending: the VM's filesystem devices are fixed when it boots.
+
+Park an agent and hand it to someone else — the bundle carries the saved VM state, the writable overlay and the workspace, and resumes mid-task on their machine:
+
+```sh
+agentos snapshot <id> && agentos export <id> -o task.agentos
+# on their machine:
+agentos import task.agentos --remap /your/path=/their/path
+agentos restore <new-id>
+```
+
+`agentos metrics` reports boot times, daemon overhead, and how much egress policy has refused. It reads a local file and sends nothing anywhere — a sandbox that phones home would be a strange thing to trust.
 
 ## Embedding
 

@@ -5,7 +5,10 @@
 //! Every microVM's VMM runs as a *child process* of this daemon so the kill
 //! switch is a plain SIGKILL with no cooperation required from the guest.
 
+mod bundle;
 mod frames;
+mod live;
+mod metrics;
 mod monitor;
 mod proxy;
 mod registry;

@@ -33,6 +33,10 @@
     font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim);
   }
   label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
+  .slider { margin-bottom: 10px; }
+  .slider label { display: flex; justify-content: space-between; align-items: baseline; }
+  .slider output { font-variant-numeric: tabular-nums; color: var(--fg); font-weight: 600; }
+  input[type=range] { width: 100%; accent-color: var(--accent); padding: 0; }
   input, select, textarea, button {
     width: 100%; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px;
@@ -131,9 +135,17 @@
       <label>Allowed hosts (comma-separated)</label>
       <input id="hosts" placeholder="api.openai.com, *.github.com">
     </div>
-    <div class="row2">
-      <div><label>vCPUs</label><input id="vcpus" type="number" value="2" min="1" max="16"></div>
-      <div><label>RAM (MiB)</label><input id="mem" type="number" value="2048" min="128"></div>
+    <div class="slider">
+      <label>vCPUs <output id="vcpusOut">2</output></label>
+      <input id="vcpus" type="range" value="2" min="1" max="16" step="1">
+    </div>
+    <div class="slider">
+      <label>RAM <output id="memOut">2048 MiB</output></label>
+      <input id="mem" type="range" value="2048" min="256" max="16384" step="256">
+    </div>
+    <div class="slider">
+      <label>Disk <output id="diskOut">8192 MiB</output></label>
+      <input id="disk" type="range" value="8192" min="1024" max="65536" step="1024">
     </div>
     <h2>Auto-kill</h2>
     <div class="row3">
@@ -155,6 +167,37 @@
     </div>
     <div id="terminal"><span class="meta">— terminal: output of the most recent run appears here —</span>
 </div>
+    <div class="pane" id="permissions" style="display:none">
+      <h2>Permissions — <span id="permTarget" class="id"></span></h2>
+      <p class="sub" id="permNow"></p>
+      <div class="row2">
+        <div>
+          <label>Network</label>
+          <select id="permNet">
+            <option value="offline">offline — no network at all</option>
+            <option value="allowlist">allowlist — only listed hosts</option>
+            <option value="full">full — public internet, LAN blocked</option>
+          </select>
+        </div>
+        <div>
+          <label>Allowed hosts</label>
+          <input id="permHosts" placeholder="api.openai.com, *.github.com">
+        </div>
+      </div>
+      <div class="row3">
+        <div><label>Kill over mem (MiB)</label><input id="permMem" type="number" placeholder="—"></div>
+        <div><label>Kill over egress (MiB)</label><input id="permEgress" type="number" placeholder="—"></div>
+        <div><label>Kill after (secs)</label><input id="permSecs" type="number" placeholder="—"></div>
+      </div>
+      <button id="permApply">Apply to running agent</button>
+      <button id="permClose" class="saveBtn">close</button>
+      <div id="permMsg" class="sub"></div>
+      <p class="sub" style="color:var(--dim)">
+        Mounts can't be changed while the sandbox exists — the VM's filesystem
+        devices are fixed when it boots. Network changes bind the next
+        connection the agent opens.
+      </p>
+    </div>
     <div class="pane" id="network">
       <h2>Network monitor</h2>
       <div id="netrows"></div>
@@ -170,6 +213,16 @@ const $ = (id) => document.getElementById(id);
 $("netmode").addEventListener("change", () => {
   $("hostsWrap").style.display = $("netmode").value === "allowlist" ? "" : "none";
 });
+
+// Sliders show the value they're setting; a slider with no readout is a guess.
+const bindSlider = (id, out, fmt) => {
+  const sync = () => { $(out).textContent = fmt(Number($(id).value)); };
+  $(id).addEventListener("input", sync);
+  sync();
+};
+bindSlider("vcpus", "vcpusOut", (v) => String(v));
+bindSlider("mem", "memOut", (v) => v >= 1024 ? `${(v / 1024).toFixed(v % 1024 ? 1 : 0)} GiB` : `${v} MiB`);
+bindSlider("disk", "diskOut", (v) => v >= 1024 ? `${(v / 1024).toFixed(v % 1024 ? 1 : 0)} GiB` : `${v} MiB`);
 
 function bytesToText(arr) {
   return new TextDecoder().decode(new Uint8Array(arr || []));
@@ -203,6 +256,7 @@ $("runBtn").addEventListener("click", async () => {
       env: $("env").value.split("\n"),
       vcpus: Number($("vcpus").value),
       memMib: Number($("mem").value),
+      diskMib: Number($("disk").value),
       killOverMem: optNum("akMem"),
       killOverEgress: optNum("akEgress"),
       killAfterSecs: optNum("akSecs"),
@@ -265,6 +319,9 @@ async function refresh() {
       } else if (st === "snapshotted") {
         cell.append(btn("restore", "saveBtn", () => invoke("restore_sandbox", { id: sb.id })));
       }
+      if (st === "running" || st === "paused") {
+        cell.append(btn("permissions", "saveBtn", async () => openPermissions(sb.id)), spacer());
+      }
       if (st === "running" || st === "paused" || st === "booting" || st === "provisioning") {
         cell.append(
           btn("kill+save", "saveBtn", () => invoke("kill_sandbox", { id: sb.id, save: true })),
@@ -297,8 +354,59 @@ listen("agentos-event", ({ payload: ev }) => {
   } else if (k.kind === "resource_sample") {
     $("stats").textContent =
       `${ev.sandbox.slice(0, 8)}  cpu ${k.cpu_percent}% · mem ${k.mem_mib} MiB · disk ${k.disk_used_mib ?? 0} MiB · egress ${(k.egress_total_bytes / 1048576).toFixed(1)} MiB`;
+  } else if (k.kind === "permissions_changed") {
+    const row = document.createElement("div");
+    row.className = "net";
+    row.innerHTML =
+      `<span class="t">${new Date(ev.timestamp_ms).toLocaleTimeString()}</span>` +
+      `<span class="v">POLICY</span><span>now ${k.net}</span>` +
+      `<span style="color:var(--dim)">${ev.sandbox.slice(0, 8)}</span>`;
+    $("netrows").prepend(row);
   } else if (k.kind === "state_changed") {
     refresh();
+  }
+});
+
+// ---- live permission editor (PRD 4.5) ----
+// Only network and auto-kill appear here, because only those can actually be
+// changed on a running VM. Offering a mount control that silently did nothing
+// would be worse than not offering it.
+let permId = null;
+function openPermissions(id) {
+  permId = id;
+  $("permTarget").textContent = id.slice(0, 8);
+  $("permMsg").textContent = "";
+  $("permissions").style.display = "";
+}
+$("permClose").addEventListener("click", () => {
+  permId = null;
+  $("permissions").style.display = "none";
+});
+$("permNet").addEventListener("change", () => {
+  $("permHosts").disabled = $("permNet").value !== "allowlist";
+});
+$("permApply").addEventListener("click", async () => {
+  if (!permId) return;
+  const mode = $("permNet").value;
+  const net = mode === "allowlist"
+    ? "allowlist:" + $("permHosts").value.split(",").map(s => s.trim()).filter(Boolean).join(",")
+    : mode;
+  const optNum = (id) => $(id).value ? Number($(id).value) : null;
+  try {
+    const now = await invoke("set_permissions", {
+      id: permId,
+      net,
+      killOverMem: optNum("permMem"),
+      killOverEgress: optNum("permEgress"),
+      killAfterSecs: optNum("permSecs"),
+    });
+    // Show what is actually in force: a fleet policy may have clamped the
+    // request, and the user needs to see that rather than their own input.
+    $("permNow").textContent = "in force: " + now.net;
+    $("permMsg").textContent = "applied";
+    termAppend(`\n■ permissions changed on ${permId.slice(0, 8)}: ${now.net}\n`, "meta");
+  } catch (e) {
+    $("permMsg").textContent = String(e);
   }
 });
 

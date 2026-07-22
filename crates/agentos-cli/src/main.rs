@@ -29,6 +29,25 @@ async fn main() {
         Command::Pause { id } => client::pause(&id).await,
         Command::Resume { id } => client::resume(&id).await,
         Command::Snapshot { id } => client::snapshot(&id).await,
+        Command::Permissions {
+            id,
+            net,
+            kill_over_mem,
+            kill_over_egress,
+            kill_after_secs,
+        } => {
+            client::set_permissions(
+                &id,
+                net.as_deref(),
+                kill_over_mem,
+                kill_over_egress,
+                kill_after_secs,
+            )
+            .await
+        }
+        Command::Export { id, out } => client::export(&id, out.as_deref()).await,
+        Command::Import { path, remap } => client::import(&path, &remap).await,
+        Command::Metrics => client::metrics().await,
         Command::Restore { id } => client::restore(&id).await,
         Command::Policy => match agentos_core::FleetPolicy::load() {
             Ok(p) if p.is_empty() => {

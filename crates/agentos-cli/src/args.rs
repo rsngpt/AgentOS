@@ -61,6 +61,45 @@ pub enum Command {
         /// Sandbox id (from `agentos ps`).
         id: String,
     },
+    /// Change a live sandbox's grants (PRD §4.5). Network changes bind the
+    /// next connection the agent opens; auto-kill changes apply within a
+    /// second. Mounts cannot change — the VM's device set is fixed at boot.
+    Permissions {
+        /// Sandbox id (from `agentos ps`).
+        id: String,
+        /// New network policy: offline | full | allowlist:host1,host2
+        #[arg(long)]
+        net: Option<String>,
+        /// Kill if guest-reported memory exceeds this (MiB).
+        #[arg(long)]
+        kill_over_mem: Option<u32>,
+        /// Kill if cumulative egress exceeds this (MiB).
+        #[arg(long)]
+        kill_over_egress: Option<u32>,
+        /// Kill after this many seconds of wall-clock runtime.
+        #[arg(long)]
+        kill_after_secs: Option<u64>,
+    },
+    /// Write a snapshotted sandbox out as a portable file a colleague can
+    /// import (PRD §7). Snapshot it first.
+    Export {
+        /// Sandbox id (from `agentos ps`).
+        id: String,
+        /// Destination file (default: ./<id>.agentos).
+        #[arg(long, short = 'o', value_name = "FILE")]
+        out: Option<String>,
+    },
+    /// Import a bundle exported elsewhere; restore it with `agentos restore`.
+    Import {
+        /// Bundle file to import.
+        path: String,
+        /// Point a mount at a local directory: ORIGINAL=LOCAL. Repeatable.
+        #[arg(long, value_name = "ORIGINAL=LOCAL")]
+        remap: Vec<String>,
+    },
+    /// Show this install's success metrics (PRD §8). Local only — Agent OS
+    /// never transmits usage data.
+    Metrics,
     /// Show the fleet policy this machine enforces, if any.
     Policy,
     /// Stream daemon events (state changes, network verdicts, resource samples).

@@ -31,7 +31,7 @@
 //! per event.
 
 use agentos_core::event::Event;
-use agentos_core::{SandboxId, SandboxSpec, SandboxState};
+use agentos_core::{AutoKillRules, SandboxId, SandboxSpec, SandboxState};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -53,6 +53,15 @@ pub enum Error {
 
 /// Result of a typed client call.
 pub type ClientResult<T> = std::result::Result<T, Error>;
+/// The grants in force on a sandbox after a `set_permissions` call — which may
+/// be tighter than what was asked for, if a fleet policy clamped it.
+#[derive(Debug, Clone)]
+pub struct Permissions {
+    /// CLI form, e.g. `allowlist:pypi.org`.
+    pub net: String,
+    pub auto_kill: AutoKillRules,
+}
+
 
 /// One sandbox as reported by [`Client::list`].
 #[derive(Debug, Clone, Deserialize)]
@@ -263,6 +272,63 @@ impl Client {
     pub async fn snapshot(&self, id: &SandboxId) -> ClientResult<String> {
         let v = self.call("sandbox.snapshot", serde_json::json!({ "id": id })).await?;
         Ok(v["dir"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// Change a live sandbox's grants (PRD §4.5). `net` takes the CLI form
+    /// (`offline` | `full` | `allowlist:a,b`); any auto-kill argument replaces
+    /// the whole rule set. Returns the grants actually in force afterwards,
+    /// which may be *tighter* than asked for if a fleet policy clamped them.
+    ///
+    /// Mounts are deliberately absent: the VM's virtio-fs device set is fixed
+    /// at creation, so the daemon refuses rather than pretending.
+    pub async fn set_permissions(
+        &self,
+        id: &SandboxId,
+        net: Option<&str>,
+        auto_kill: Option<AutoKillRules>,
+    ) -> ClientResult<Permissions> {
+        let mut params = serde_json::json!({ "id": id });
+        if let Some(net) = net {
+            params["net"] = serde_json::json!(net);
+        }
+        if let Some(rules) = auto_kill {
+            params["max_mem_mib"] = serde_json::json!(rules.max_mem_mib);
+            params["max_egress_mib"] = serde_json::json!(rules.max_egress_mib);
+            params["max_runtime_secs"] = serde_json::json!(rules.max_runtime_secs);
+        }
+        let v = self.call("sandbox.set_permissions", params).await?;
+        Ok(Permissions {
+            net: v["net"].as_str().unwrap_or_default().to_string(),
+            auto_kill: serde_json::from_value(v["auto_kill"].clone()).unwrap_or_default(),
+        })
+    }
+
+    /// Write a snapshotted sandbox out as a portable bundle (PRD §7's "share it
+    /// with a colleague"). The sandbox must have been snapshotted first.
+    pub async fn export(&self, id: &SandboxId, dest: &str) -> ClientResult<u64> {
+        let v = self
+            .call("sandbox.export", serde_json::json!({ "id": id, "dest": dest }))
+            .await?;
+        Ok(v["bytes"].as_u64().unwrap_or(0))
+    }
+
+    /// Import a bundle, returning the new local sandbox id. `remap` entries are
+    /// `original=local` for mounts that live at a different path here.
+    pub async fn import(&self, path: &str, remap: &[String]) -> ClientResult<SandboxId> {
+        let v = self
+            .call(
+                "sandbox.import",
+                serde_json::json!({ "path": path, "remap": remap }),
+            )
+            .await?;
+        serde_json::from_value(v["id"].clone())
+            .map_err(|e| Error::Daemon(format!("daemon returned no usable id: {e}")))
+    }
+
+    /// PRD §8 success metrics, computed from this machine's local log.
+    /// Nothing is transmitted anywhere — see the daemon's `metrics` module.
+    pub async fn metrics(&self) -> ClientResult<serde_json::Value> {
+        self.call("metrics.summary", serde_json::json!({})).await
     }
 
     /// Panic button: terminate the most recently started sandbox that is still

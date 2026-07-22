@@ -280,6 +280,101 @@ else
         "$(echo "$out" | grep -q 'build-guest-image.sh --variant devops' && echo yes || echo no)"
 fi
 
+echo "== live permissions: tightening binds an agent that is already running =="
+# The user-level question: an agent is fetching happily, you revoke its
+# network, does the *next* fetch actually fail? Nothing about the code's shape
+# proves that — only watching the traffic stop does.
+"$AGENTOS" run --net allowlist:example.com -- sh -c \
+    'i=0; while [ $i -lt 20 ]; do wget -q -O- -T 3 http://example.com >/dev/null 2>&1 \
+        && echo ok || echo blocked; sleep 2; i=$((i+1)); done' \
+    > /tmp/agentos-e2e-perm.txt 2>&1 &
+perm_runner=$!
+sleep 12
+id=$("$AGENTOS" ps | awk '$3=="running"{print $1; exit}')
+if [ -n "$id" ]; then
+    check "agent reaches its allowlisted host before the change" "yes" \
+        "$(grep -q '^ok' /tmp/agentos-e2e-perm.txt && echo yes || echo no)"
+    out=$("$AGENTOS" permissions "$id" --net offline 2>&1)
+    check "permission change reports what is in force" "net: offline" "$(echo "$out" | head -1)"
+    : > /tmp/agentos-e2e-perm.txt   # only judge attempts made after the change
+    sleep 7
+    check "egress stops for the running agent" "no" \
+        "$(grep -q '^ok' /tmp/agentos-e2e-perm.txt && echo yes || echo no)"
+    # Auto-kill tightened mid-run must fire on the already-running sandbox.
+    "$AGENTOS" permissions "$id" --kill-after-secs 1 >/dev/null 2>&1
+    sleep 4
+    check "auto-kill rule added mid-run terminates it" "yes" \
+        "$("$AGENTOS" ps | awk -v i="$id" '$1==i{print $3}' | grep -q killed && echo yes || echo no)"
+    # A client asking to change mounts must be told no, not silently ignored —
+    # the CLI can't express it, so this goes straight at the daemon socket.
+    req='{"id":1,"method":"sandbox.set_permissions","params":{"id":"'"$id"'","mounts":["/tmp:rw"]}}'
+    reply=$(printf '%s\n' "$req" | nc -U "$HOME/.agentos/agentosd.sock" 2>/dev/null | head -1)
+    check "a mount change is refused, not silently dropped" "yes" \
+        "$(echo "$reply" | grep -q 'device set is fixed' && echo yes || echo no)"
+    kill "$perm_runner" 2>/dev/null; wait "$perm_runner" 2>/dev/null
+else
+    echo "FAIL: live permissions — no running sandbox found" >&2
+    kill "$perm_runner" 2>/dev/null
+    FAILURES=$((FAILURES + 1))
+fi
+
+echo "== snapshot bundles: export here, import as if on another machine =="
+"$AGENTOS" run -- sh -c 'i=1; while [ $i -le 60 ]; do echo "b $i"; i=$((i+1)); sleep 1; done' \
+    > /tmp/agentos-e2e-bundle.txt 2>&1 &
+bundler=$!
+sleep 8
+id=$("$AGENTOS" ps | awk '$3=="running"{print $1; exit}')
+if [ -n "$id" ]; then
+    reached=$(grep -c '^b ' /tmp/agentos-e2e-bundle.txt)
+    "$AGENTOS" snapshot "$id" >/dev/null 2>&1
+    wait "$bundler" 2>/dev/null
+    sleep 1
+    rm -f /tmp/agentos-e2e.agentos
+    "$AGENTOS" export "$id" -o /tmp/agentos-e2e.agentos >/dev/null 2>&1
+    check "export produces a bundle" "0" "$([ -s /tmp/agentos-e2e.agentos ] && echo 0 || echo 1)"
+    check "the bundle carries the saved VM state" "yes" \
+        "$(tar -tzf /tmp/agentos-e2e.agentos 2>/dev/null | grep -q '^vmstate' && echo yes || echo no)"
+
+    # The colleague's machine: the original sandbox is gone entirely.
+    rm -rf "$HOME/.agentos/sandboxes/$id"
+    pkill -f "$(basename "$AGENTOS")d" 2>/dev/null; sleep 2
+    newid=$("$AGENTOS" import /tmp/agentos-e2e.agentos 2>/dev/null | awk '/imported as/{print $3}')
+    check "import mints a new local sandbox" "yes" \
+        "$([ -n "$newid" ] && echo yes || echo no)"
+    if [ -n "$newid" ]; then
+        "$AGENTOS" restore "$newid" > /tmp/agentos-e2e-restored.txt 2>&1 &
+        restorer=$!
+        sleep 10
+        # The point of the whole feature: it continues, it doesn't start over.
+        first=$(grep -m1 '^b ' /tmp/agentos-e2e-restored.txt | awk '{print $2}')
+        check "imported bundle resumes mid-task rather than restarting" "yes" \
+            "$([ -n "$first" ] && [ "$first" -gt "$reached" ] && echo yes || echo no)"
+        "$AGENTOS" kill --newest >/dev/null 2>&1
+        kill "$restorer" 2>/dev/null; wait "$restorer" 2>/dev/null
+    fi
+    rm -f /tmp/agentos-e2e.agentos
+else
+    echo "FAIL: bundle export — no running sandbox found" >&2
+    kill "$bundler" 2>/dev/null
+    FAILURES=$((FAILURES + 1))
+fi
+
+echo "== a bundle cannot smuggle in a path this machine doesn't have =="
+out=$(printf 'not a bundle\n' > /tmp/agentos-e2e-bad.agentos; \
+      "$AGENTOS" import /tmp/agentos-e2e-bad.agentos 2>&1)
+check "a non-bundle file is refused clearly" "yes" \
+    "$(echo "$out" | grep -qi 'bundle' && echo yes || echo no)"
+rm -f /tmp/agentos-e2e-bad.agentos
+
+echo "== metrics: PRD 8, computed locally =="
+out=$("$AGENTOS" metrics 2>&1)
+check "metrics reports boot times it measured" "yes" \
+    "$(echo "$out" | grep -q 'Time to boot' && echo yes || echo no)"
+check "metrics states nothing is transmitted" "yes" \
+    "$(echo "$out" | grep -q 'nothing is transmitted' && echo yes || echo no)"
+check "metrics counts sandboxes this install has run" "yes" \
+    "$(echo "$out" | grep -qE 'sandboxes run: [1-9]' && echo yes || echo no)"
+
 echo
 if [ "$FAILURES" -eq 0 ]; then
     echo "e2e: all tests passed"

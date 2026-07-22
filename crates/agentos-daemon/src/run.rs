@@ -19,6 +19,7 @@ use tracing::info;
 
 use crate::monitor;
 use crate::proxy;
+use crate::metrics;
 use crate::registry::Registry;
 use crate::frames;
 
@@ -80,6 +81,18 @@ pub fn state_path(sandbox_dir: &std::path::Path) -> PathBuf {
 /// a restore survives the daemon exiting, which the in-memory registry can't.
 fn spec_path(sandbox_dir: &std::path::Path) -> PathBuf {
     sandbox_dir.join("spec.json")
+}
+
+/// Write a sandbox's spec beside its state. Called on boot and again whenever
+/// permissions change, so a restore always comes back with the grants that
+/// were in force — not the ones it originally started with.
+pub fn persist_spec(id: &agentos_core::SandboxId, spec: &SandboxSpec) {
+    let dir = sandbox_dir(id);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        if let Ok(json) = serde_json::to_vec_pretty(spec) {
+            let _ = std::fs::write(spec_path(&dir), json);
+        }
+    }
 }
 
 /// Re-register sandboxes that were snapshotted before the daemon stopped.
@@ -193,7 +206,7 @@ pub async fn run_sandbox(
     }
 }
 
-fn agentos_home() -> PathBuf {
+pub fn agentos_home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").expect("HOME not set")).join(".agentos")
 }
 
@@ -342,17 +355,28 @@ async fn drive(
     // The socket location is the backend's call: guest-initiated vsock
     // connections must land on it (CH's hybrid vsock names it by convention).
     let egress_bytes = Arc::new(AtomicU64::new(0));
+    // The grants the proxy and monitor read on every decision, so a permission
+    // edit lands on a running agent rather than only on the next one.
+    let permissions = Arc::new(crate::live::LivePermissions::new(
+        spec.net.clone(),
+        spec.auto_kill,
+    ));
+    registry.set_permissions_handle(id, permissions.clone()).await;
     let (proxy_socket, proxy_task) = if matches!(spec.net, NetPolicy::Offline) {
+        // Offline starts with no proxy at all. Binding the socket anyway would
+        // mean an offline sandbox could be widened later — which is a feature
+        // for `full`/allowlist but would quietly weaken the strongest mode, so
+        // offline stays a boot-time decision with no egress path in existence.
         (None, None)
     } else {
         let path = backend.proxy_socket_path(&sandbox_dir);
-        let policy = spec.net.clone();
+        let perms = permissions.clone();
         let bytes = egress_bytes.clone();
         let sock = path.clone();
         let reg = registry.clone();
         let sid = id.clone();
         let task = tokio::spawn(async move {
-            if let Err(e) = proxy::serve(&sock, policy, bytes, reg, sid).await {
+            if let Err(e) = proxy::serve(&sock, perms, bytes, reg, sid).await {
                 tracing::warn!(error = %e, "egress proxy stopped");
             }
         });
@@ -368,6 +392,9 @@ async fn drive(
         proxy_socket,
     };
 
+    // PRD §8 "time to boot": spawn -> the guest answering the handshake, which
+    // is the first moment the sandbox can actually do anything.
+    let boot_started = std::time::Instant::now();
     // Boot, or bring a snapshot back.
     let mut handle = match &restore_from {
         Some(state) => {
@@ -449,6 +476,7 @@ async fn drive(
         .await?;
     }
     registry.set_state(id, SandboxState::Running).await;
+    metrics::started(&home, boot_started.elapsed().as_millis() as u64);
     emit(client, json!({ "event": "running" }))
         .await
         .map_err(Error::Io)?;
@@ -490,7 +518,7 @@ async fn drive(
     let monitor_task = tokio::spawn(monitor::watch(
         registry.clone(),
         id.clone(),
-        spec.auto_kill,
+        permissions.clone(),
         guest_cpu.clone(),
         guest_mem.clone(),
         guest_disk.clone(),
@@ -537,6 +565,7 @@ async fn drive(
     match exit_info {
         Some(info) => {
             registry.set_state(id, SandboxState::Exited { info }).await;
+            metrics::ended(&home, "exited");
             std::fs::remove_dir_all(&sandbox_dir).ok(); // normal exit: wipe
             emit(
                 client,
@@ -563,6 +592,14 @@ async fn drive(
                 Some(SandboxState::Killed { reason, disposition }) => (reason, disposition),
                 _ => ("vmm died".to_string(), TerminationDisposition::Save),
             };
+            metrics::ended(
+                &home,
+                if reason.starts_with("auto-kill") {
+                    "auto_killed"
+                } else {
+                    "killed"
+                },
+            );
             match disposition {
                 TerminationDisposition::Wipe => {
                     std::fs::remove_dir_all(&sandbox_dir).ok();

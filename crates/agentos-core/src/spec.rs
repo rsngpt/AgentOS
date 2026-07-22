@@ -137,6 +137,16 @@ impl NetPolicy {
             },
         }
     }
+
+    /// The CLI form, so a policy can be round-tripped through `parse` and shown
+    /// back to the user in the words they'd type.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Offline => "offline".into(),
+            Self::Full => "full".into(),
+            Self::Allowlist(hosts) => format!("allowlist:{}", hosts.join(",")),
+        }
+    }
 }
 
 /// Hard resource caps fixed at VM creation; cannot be raised while running.

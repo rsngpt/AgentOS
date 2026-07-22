@@ -99,6 +99,7 @@ async fn run_sandbox(
     env: Vec<String>,
     vcpus: u8,
     mem_mib: u32,
+    disk_mib: u32,
     kill_over_mem: Option<u32>,
     kill_over_egress: Option<u32>,
     kill_after_secs: Option<u64>,
@@ -152,7 +153,7 @@ async fn run_sandbox(
         limits: ResourceLimits {
             vcpus,
             mem_mib,
-            ..Default::default()
+            disk_mib,
         },
         auto_kill: AutoKillRules {
             max_mem_mib: kill_over_mem,
@@ -200,6 +201,34 @@ fn run_event_json(event: RunEvent) -> Value {
         RunEvent::Snapshotted { dir } => json!({ "event": "snapshotted", "dir": dir }),
         RunEvent::Unknown(v) => v,
     }
+}
+
+/// PRD §4.5's permission controls, applied to an agent that is already
+/// running. Returns the grants actually in force — which a fleet policy may
+/// have tightened — so the window can show the truth rather than the request.
+#[tauri::command]
+async fn set_permissions(
+    id: String,
+    net: Option<String>,
+    kill_over_mem: Option<u32>,
+    kill_over_egress: Option<u32>,
+    kill_after_secs: Option<u64>,
+) -> Result<Value, String> {
+    let rules = if kill_over_mem.is_some() || kill_over_egress.is_some() || kill_after_secs.is_some()
+    {
+        Some(AutoKillRules {
+            max_mem_mib: kill_over_mem,
+            max_egress_mib: kill_over_egress,
+            max_runtime_secs: kill_after_secs,
+        })
+    } else {
+        None
+    };
+    let now = client()
+        .set_permissions(&parse_id(&id)?, net.as_deref(), rules)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!({ "net": now.net, "auto_kill": now.auto_kill }))
 }
 
 /// Panic kill switch: terminate the most-recently-started running sandbox.
@@ -257,6 +286,7 @@ fn main() {
             list_sandboxes,
             kill_sandbox,
             panic_kill,
+            set_permissions,
             pause_sandbox,
             resume_sandbox,
             snapshot_sandbox,

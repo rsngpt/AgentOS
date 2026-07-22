@@ -27,6 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 
+use crate::live::LivePermissions;
 use crate::registry::Registry;
 
 const MAX_HEADER: usize = 16 * 1024;
@@ -40,7 +41,7 @@ const MAX_CONNECTIONS: usize = 64;
 /// Serve the egress proxy for one sandbox on `socket_path` until aborted.
 pub async fn serve(
     socket_path: &Path,
-    policy: NetPolicy,
+    permissions: Arc<LivePermissions>,
     bytes_total: Arc<AtomicU64>,
     registry: Registry,
     sandbox: SandboxId,
@@ -50,7 +51,9 @@ pub async fn serve(
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (mut conn, _) = listener.accept().await?;
-        let policy = policy.clone();
+        // Read the policy per connection, not once at startup: a permission
+        // edit must bind the next connection the guest opens.
+        let policy = permissions.net();
         let bytes = bytes_total.clone();
         let registry = registry.clone();
         let sandbox = sandbox.clone();
@@ -128,6 +131,12 @@ async fn handle_connection(
     if host.is_empty() || !verdict(&policy, &host) {
         info!(%host, port, verdict = "deny", "egress");
         emit_verdict(false);
+        // A refusal aimed at a literal local address is a lateral-move attempt
+        // (PRD §2), not just a blocked download — counted apart in `metrics`.
+        crate::metrics::egress_denied(
+            &crate::run::agentos_home(),
+            host.parse().map(|ip| is_local_ip(&ip)).unwrap_or(false),
+        );
         return refuse(&mut guest, "403 Forbidden").await;
     }
 
@@ -140,6 +149,9 @@ async fn handle_connection(
     if addrs.is_empty() {
         info!(%host, port, verdict = "deny-resolved-local-or-unresolvable", "egress");
         emit_verdict(false);
+        // Allowed by name but every address resolved into local space: a DNS
+        // rebind aimed at the host's own network. Always a containment event.
+        crate::metrics::egress_denied(&crate::run::agentos_home(), true);
         return refuse(&mut guest, "403 Forbidden").await;
     }
 

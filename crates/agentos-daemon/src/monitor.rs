@@ -14,6 +14,7 @@ use agentos_core::event::EventKind;
 use agentos_core::{AutoKillRules, SandboxId, TerminationDisposition};
 use tracing::warn;
 
+use crate::live::LivePermissions;
 use crate::registry::Registry;
 
 /// Evaluate rules against one sample. Returns the name of the rule that
@@ -42,7 +43,7 @@ pub fn breached_rule(
 pub async fn watch(
     registry: Registry,
     id: SandboxId,
-    rules: AutoKillRules,
+    permissions: Arc<LivePermissions>,
     guest_cpu_percent: Arc<AtomicU32>,
     guest_mem_mib: Arc<AtomicU32>,
     guest_disk_mib: Arc<AtomicU32>,
@@ -66,6 +67,8 @@ pub async fn watch(
                 disk_used_mib: guest_disk_mib.load(Ordering::Relaxed),
             },
         );
+        // Re-read every tick so a rule tightened mid-run applies immediately.
+        let rules = permissions.auto_kill();
         if let Some(rule) = breached_rule(&rules, mem, egress_mib, runtime) {
             warn!(%id, rule, mem, egress_mib, runtime, "auto-kill rule fired");
             registry.emit_event(id.clone(), EventKind::AutoKillTriggered { rule: rule.into() });

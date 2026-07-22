@@ -183,6 +183,71 @@ Split into two halves with very different costs:
 
   Save/restore is arm64-only and needs macOS 14+.
 
+## 14. Sharing a snapshot (PRD §7)
+
+A snapshot is a *directory* of machine-local things: absolute mount paths, and
+on macOS a `machine-id` that VZ refuses to restore without. `agentos export`
+packs the portable parts (`vmstate`, `overlay.img`, `workspace`, `spec.json`,
+`machine-id`) with a manifest; `agentos import` mints a **new** sandbox id and
+unpacks into its own directory, so the same bundle can be imported by several
+people, or twice by one.
+
+What the design turns into a refusal rather than a mysterious failure:
+
+- **Architecture, hypervisor backend, and guest protocol version** are checked
+  against the manifest before anything is unpacked. A saved RAM image is
+  portable across none of them, and the hypervisor's own error for this is
+  unreadable.
+- **Mounts the importer doesn't have.** The bundle names paths on the
+  *exporter's* machine. Creating them would invent data the guest expects;
+  dropping them would change the device set the saved VM was running with. So
+  import refuses and prints each unsatisfied path, and `--remap old=new` is how
+  the importer points them at their own copies.
+- **The importer's fleet policy is applied, not the exporter's.** A bundle must
+  not be a way to carry permissions past the receiving machine's rules. If local
+  policy would alter the *mounts*, the import refuses outright, since the
+  restored guest cannot survive a changed device set.
+
+## 15. Changing permissions on a running agent (PRD §4.5)
+
+The dashboard's permission controls are only meaningful if they work on an agent
+that is already running. Two of the three grant kinds can be changed live, and
+the split is a consequence of where enforcement lives:
+
+- **Network policy** is enforced entirely host-side, in the proxy, which
+  re-reads it on every connection — so a revocation binds the agent's next
+  connection. Nothing inside the guest is consulted or trusted.
+- **Auto-kill rules** are read by the monitor each second.
+- **Mounts and CPU/RAM/disk cannot change.** They are the VM's device set, fixed
+  at creation; the guest has already mounted the shares. The RPC refuses a mount
+  change explicitly instead of accepting it and silently not enforcing it — a
+  permission UI that lies is worse than one that says no.
+
+Edits re-enter `FleetPolicy::apply`. Permission editing is a second door into
+the decision `run_sandbox` guards, and a door that skipped the check would let
+any user start compliant and then widen. One asymmetry is deliberate: an
+`offline` sandbox has no proxy socket in existence, so it can be tightened *to*
+offline but never widened *from* it.
+
+## 16. Success metrics (PRD §8)
+
+Recorded to `~/.agentos/metrics.jsonl`, read back by `agentos metrics`.
+**Nothing is transmitted anywhere.** Adoption and escape rates are normally
+collected by phoning home, which for a product whose promise is "your data does
+not leave this machine" would undercut the thing being sold; an admin who wants
+fleet-wide numbers can collect a line-oriented JSON file with tooling they
+already trust.
+
+Two of the four are honest measurements: **time to boot** (spawn → the guest
+answering the handshake, i.e. the first moment the sandbox can do anything) and
+**performance overhead** (the daemon's own RSS/CPU). **Adoption** can only ever
+describe *this* install, so it reports exactly that. **Zero-escape rate** is
+deliberately not claimed as a measurement at all: an escape is a hypervisor
+compromise, which the host cannot observe from outside, so reporting "0 escapes"
+would be theatre. What is reported instead is what is genuinely evidenced —
+egress the proxy refused, and how much of it was aimed at loopback/LAN/metadata
+space, which is the signature of the lateral movement in §2.
+
 ## 12. PRD Requirement Traceability
 
 | PRD § | Requirement | Covered in |
@@ -191,4 +256,6 @@ Split into two halves with very different costs:
 | 4.2 | Mounts (RO/RW/none, deny-default), network modes, LAN/localhost blocking, git without SSH keys | §6, §7 |
 | 4.3 | Kill switch: instant, absolute, save-or-wipe | §9 |
 | 4.4 | Quotas, live dashboard, auto-kill triggers | §10 |
-| 4.5 | GUI + CLI | §3, §11 (M4) |
+| 4.5 | GUI + CLI, permission controls | §3, §11 (M4), §15 |
+| 7 | Fleet policy, snapshotting **incl. sharing**, templates | §13, §12, §14 |
+| 8 | Success metrics | §16 |

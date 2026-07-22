@@ -130,6 +130,130 @@ pub async fn kill(id: &str, save: bool) -> Result<i32, String> {
     Ok(0)
 }
 
+/// Adjust a running sandbox's grants. Prints what is *actually* in force
+/// afterwards rather than echoing the request, because a fleet policy may have
+/// clamped it — the user needs to see the difference.
+pub async fn set_permissions(
+    id: &str,
+    net: Option<&str>,
+    kill_over_mem: Option<u32>,
+    kill_over_egress: Option<u32>,
+    kill_after_secs: Option<u64>,
+) -> Result<i32, String> {
+    let rules = if kill_over_mem.is_some() || kill_over_egress.is_some() || kill_after_secs.is_some()
+    {
+        Some(agentos_core::AutoKillRules {
+            max_mem_mib: kill_over_mem,
+            max_egress_mib: kill_over_egress,
+            max_runtime_secs: kill_after_secs,
+        })
+    } else {
+        None
+    };
+    let now = client()
+        .set_permissions(&parse_id(id)?, net, rules)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("net: {}", now.net);
+    let ak = now.auto_kill;
+    if ak.max_mem_mib.is_none() && ak.max_egress_mib.is_none() && ak.max_runtime_secs.is_none() {
+        println!("auto-kill: none");
+    } else {
+        let describe = |label: &str, v: Option<String>| v.map(|v| format!("{label}={v}"));
+        let parts: Vec<String> = [
+            describe("mem_mib", ak.max_mem_mib.map(|v| v.to_string())),
+            describe("egress_mib", ak.max_egress_mib.map(|v| v.to_string())),
+            describe("runtime_secs", ak.max_runtime_secs.map(|v| v.to_string())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        println!("auto-kill: {}", parts.join(" "));
+    }
+    Ok(0)
+}
+
+/// Export a snapshot as a shareable bundle.
+pub async fn export(id: &str, out: Option<&str>) -> Result<i32, String> {
+    let sid = parse_id(id)?;
+    let dest = match out {
+        Some(p) => p.to_string(),
+        None => format!("{sid}.agentos"),
+    };
+    let bytes = client()
+        .export(&sid, &dest)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("exported {dest} ({:.1} MiB)", bytes as f64 / (1024.0 * 1024.0));
+    println!("import it elsewhere with: agentos import {dest}");
+    Ok(0)
+}
+
+/// Import a bundle someone else exported.
+pub async fn import(path: &str, remap: &[String]) -> Result<i32, String> {
+    let id = client()
+        .import(path, remap)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("imported as {id}");
+    println!("resume it with: agentos restore {id}");
+    Ok(0)
+}
+
+/// PRD §8 success metrics, computed locally.
+pub async fn metrics() -> Result<i32, String> {
+    let m = client().metrics().await.map_err(|e| e.to_string())?;
+    let n = |k: &str| m[k].as_u64().unwrap_or(0);
+    let started = n("sandboxes_started");
+
+    println!("Agent OS metrics — this install only, nothing is transmitted\n");
+
+    println!("Time to boot (PRD §8)");
+    if started == 0 {
+        println!("  no sandboxes recorded yet");
+    } else {
+        println!(
+            "  p50 {} ms   p95 {} ms   min {} ms   max {} ms   (n={started})",
+            n("boot_ms_p50"),
+            n("boot_ms_p95"),
+            n("boot_ms_min"),
+            n("boot_ms_max"),
+        );
+    }
+
+    println!("\nPerformance overhead");
+    println!(
+        "  daemon: {} MiB resident, {:.1}% CPU",
+        n("daemon_rss_mib"),
+        m["daemon_cpu_percent"].as_f64().unwrap_or(0.0),
+    );
+
+    println!("\nAdoption (this install)");
+    println!("  install id:    {}", m["install_id"].as_str().unwrap_or("?"));
+    println!("  active days:   {}", n("active_days"));
+    println!("  sandboxes run: {started}");
+    if let Some(outcomes) = m["outcomes"].as_object() {
+        if !outcomes.is_empty() {
+            let parts: Vec<String> = outcomes
+                .iter()
+                .map(|(k, v)| format!("{k}={}", v.as_u64().unwrap_or(0)))
+                .collect();
+            println!("  outcomes:      {}", parts.join(" "));
+        }
+    }
+
+    println!("\nContainment (what 'zero-escape rate' can honestly report)");
+    println!("  egress refused by policy:   {}", n("egress_denied"));
+    println!("  …aimed at local/LAN space:  {}", n("egress_denied_local"));
+    println!(
+        "  sandbox escapes detected:   0 — but note this is not a measurement.\n\
+         \x20 An escape is a hypervisor compromise, which the host cannot observe\n\
+         \x20 from outside. The counts above are what is genuinely evidenced: the\n\
+         \x20 boundary being tested and holding."
+    );
+    Ok(0)
+}
+
 /// Panic kill: the newest live sandbox, wiped. Shares `kill_newest_live` with
 /// the GUI's global hotkey, so exercising this exercises that path too.
 pub async fn kill_newest() -> Result<i32, String> {

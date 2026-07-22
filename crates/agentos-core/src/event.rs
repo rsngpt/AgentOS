@@ -36,4 +36,8 @@ pub enum EventKind {
     },
     /// An auto-kill rule fired; a `StateChanged` to `Killed` follows.
     AutoKillTriggered { rule: String },
+    /// A live sandbox's grants were changed (PRD §4.5 permission controls).
+    /// Emitted after the change is in force, so a dashboard that shows current
+    /// permissions can never display a grant the proxy isn't already applying.
+    PermissionsChanged { net: String },
 }

@@ -6,9 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentos_core::event::{Event, EventKind};
 use agentos_core::{
-    Error, Result, SandboxId, SandboxSpec, SandboxState, TerminationDisposition,
+    AutoKillRules, Error, NetPolicy, Result, SandboxId, SandboxSpec, SandboxState,
+    TerminationDisposition,
 };
 use agentos_vmm::VmHandle;
+
+use crate::live::LivePermissions;
 use tokio::sync::{broadcast, Mutex};
 
 /// Shared, lockable VM handle. The run task holds the lock only briefly
@@ -20,6 +23,9 @@ pub struct Sandbox {
     pub spec: SandboxSpec,
     pub state: SandboxState,
     pub handle: Option<SharedHandle>,
+    /// The grants the proxy and monitor actually consult. `spec` is kept in
+    /// step so a snapshot restores with the permissions in force at the time.
+    pub permissions: Option<Arc<LivePermissions>>,
 }
 
 #[derive(Clone)]
@@ -62,6 +68,7 @@ impl Registry {
                 spec,
                 state: SandboxState::Provisioning,
                 handle: None,
+                permissions: None,
             },
         );
         id
@@ -74,6 +81,7 @@ impl Registry {
             spec,
             state: SandboxState::Snapshotted,
             handle: None,
+            permissions: None,
         });
     }
 
@@ -194,6 +202,78 @@ impl Registry {
     /// Spec of a sandbox, for restoring it later.
     pub async fn spec(&self, id: &SandboxId) -> Option<SandboxSpec> {
         self.inner.lock().await.get(id).map(|sb| sb.spec.clone())
+    }
+
+    /// Attach the live grants a booting sandbox's proxy and monitor read from.
+    pub async fn set_permissions_handle(&self, id: &SandboxId, perms: Arc<LivePermissions>) {
+        if let Some(sb) = self.inner.lock().await.get_mut(id) {
+            sb.permissions = Some(perms);
+        }
+    }
+
+    /// Change a live sandbox's grants (PRD §4.5: the dashboard's permission
+    /// controls, which are only meaningful if they work on a running agent).
+    ///
+    /// Two constraints that are not negotiable:
+    ///
+    /// - **Fleet policy is re-applied here.** Editing permissions is a second
+    ///   door into the same decision `run_sandbox` guards; letting it through
+    ///   unchecked would let any user widen a sandbox past what IT allows by
+    ///   starting compliant and then editing. The new grants go through
+    ///   `FleetPolicy::apply` exactly as the original spec did.
+    /// - **Only network and auto-kill can change.** Mounts and CPU/RAM/disk are
+    ///   fixed in the VM's device set at creation; see `live.rs`.
+    pub async fn set_permissions(
+        &self,
+        id: &SandboxId,
+        net: Option<NetPolicy>,
+        auto_kill: Option<AutoKillRules>,
+    ) -> Result<SandboxSpec> {
+        let mut guard = self.inner.lock().await;
+        let sb = guard
+            .get_mut(id)
+            .ok_or_else(|| Error::UnknownSandbox(id.clone()))?;
+        if sb.state.is_terminal() {
+            return Err(Error::InvalidState {
+                id: id.clone(),
+                state: format!("{:?}", sb.state),
+                reason: "cannot change the permissions of a terminated sandbox".into(),
+            });
+        }
+
+        // Build the spec the sandbox *would* have, and hold it to the same
+        // machine-wide policy a fresh run would face.
+        let mut proposed = sb.spec.clone();
+        if let Some(net) = net {
+            proposed.net = net;
+        }
+        if let Some(rules) = auto_kill {
+            proposed.auto_kill = rules;
+        }
+        let policy = agentos_core::FleetPolicy::load()?;
+        let proposed = if policy.is_empty() {
+            proposed
+        } else {
+            policy.apply(proposed)?
+        };
+
+        // Apply to the values the proxy and monitor actually read. Without a
+        // live handle (a snapshotted sandbox) the spec change still lands and
+        // takes effect when it is restored.
+        if let Some(perms) = &sb.permissions {
+            perms.set_net(proposed.net.clone());
+            perms.set_auto_kill(proposed.auto_kill);
+        }
+        sb.spec = proposed.clone();
+        drop(guard);
+
+        self.emit_event(
+            id.clone(),
+            EventKind::PermissionsChanged {
+                net: proposed.net.describe(),
+            },
+        );
+        Ok(proposed)
     }
 
     /// The kill switch: SIGKILL the VMM child. Absolute and immediate.
